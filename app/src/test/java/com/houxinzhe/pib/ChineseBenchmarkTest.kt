@@ -15,6 +15,7 @@ import com.houxinzhe.pib.data.AttachmentLoader
 import com.houxinzhe.pib.data.ButlerParser
 import com.houxinzhe.pib.data.ButlerStore
 import com.houxinzhe.pib.data.ChatStore
+import com.houxinzhe.pib.data.Settings
 import com.houxinzhe.pib.data.TripKind
 import com.houxinzhe.pib.llm.BalanceClient
 import com.houxinzhe.pib.llm.ChatMessage
@@ -23,14 +24,21 @@ import com.houxinzhe.pib.llm.ToolCall
 import com.houxinzhe.pib.tools.AlarmSetTool
 import com.houxinzhe.pib.tools.AmapClient
 import com.houxinzhe.pib.tools.AppHandoffTool
+import com.houxinzhe.pib.tools.BridgeConfig
+import com.houxinzhe.pib.tools.BridgeException
+import com.houxinzhe.pib.tools.BridgeExecTool
+import com.houxinzhe.pib.tools.BridgeStatusTool
 import com.houxinzhe.pib.tools.CalendarAddTool
 import com.houxinzhe.pib.tools.CalendarListTool
+import com.houxinzhe.pib.tools.DshDelegateTool
+import com.houxinzhe.pib.tools.DshStatusTool
 import com.houxinzhe.pib.tools.HandoffCatalog
 import com.houxinzhe.pib.tools.OpenMeteoWeather
 import com.houxinzhe.pib.tools.ParcelAddTool
 import com.houxinzhe.pib.tools.ParcelDoneTool
 import com.houxinzhe.pib.tools.ParcelListTool
 import com.houxinzhe.pib.tools.PlaceSearchTool
+import com.houxinzhe.pib.tools.RemoteBridgeClient
 import com.houxinzhe.pib.tools.RoutePlanTool
 import com.houxinzhe.pib.tools.ScreenActTool
 import com.houxinzhe.pib.tools.ScreenReadTool
@@ -294,9 +302,10 @@ class ChineseBenchmarkTest {
         assertThat(wx.text).contains("浙江杭州 现在 晴，18.5°C")
         assertThat(wx.text).contains("小到中雨 11.0~20.0°C")
 
-        // Registry completeness: all 15 tools have unique names & valid JSON schemas
+        // Registry completeness: all 19 tools have unique names & valid JSON schemas
         val amap = AmapClient(key = { "" })
         val butler = ButlerStore(null)
+        val bridge = RemoteBridgeClient(config = { BridgeConfig(false, "", "", "") })
         val reg = ToolRegistry(
             listOf(
                 AlarmSetTool(), TimerSetTool(), CalendarAddTool(), CalendarListTool(),
@@ -304,10 +313,41 @@ class ChineseBenchmarkTest {
                 ParcelAddTool(butler), ParcelListTool(butler), ParcelDoneTool(butler),
                 TripAddTool(butler), TripListTool(butler),
                 AppHandoffTool(), ScreenReadTool(), ScreenActTool(),
+                BridgeStatusTool(bridge), BridgeExecTool(bridge),
+                DshDelegateTool(bridge), DshStatusTool(bridge),
             )
         )
-        assertThat(reg.all).hasSize(15)
-        assertThat(reg.specs().map { it.name }.distinct()).hasSize(15)
+        assertThat(reg.all).hasSize(19)
+        assertThat(reg.specs().map { it.name }.distinct()).hasSize(19)
         assertThat(TimeParse.dateTime("2026/11/25 08:30")).isNotNull()
+    }
+
+    @Test fun dshAndComputerBridgePairingAndEndpointSecurity() {
+        val pair = Settings.parseBridgePairingUri(
+            "pib://pair-bridge?url=http%3A%2F%2F192.168.1.20%3A18792&token=0123456789abcdef0123456789abcdef&fallback=http%3A%2F%2F100.88.1.2%3A18792"
+        )!!
+        assertThat(pair.url).isEqualTo("http://192.168.1.20:18792")
+        assertThat(pair.fallback).isEqualTo("http://100.88.1.2:18792")
+        assertThat(pair.token).hasLength(32)
+        // Reject short tokens or wrong schemes
+        assertThat(Settings.parseBridgePairingUri("pib://pair-bridge?url=http://10.0.0.2:18792&token=short")).isNull()
+        assertThat(Settings.parseBridgePairingUri("https://example.com?url=x&token=0123456789abcdef0123456789abcdef")).isNull()
+
+        // Allow cleartext HTTP ONLY on LAN / Tailscale / Bonjour / loopback
+        assertThat(RemoteBridgeClient.validateEndpoint("http://192.168.31.10:18792")).isEqualTo("http://192.168.31.10:18792")
+        assertThat(RemoteBridgeClient.validateEndpoint("http://100.101.2.3:18792")).isEqualTo("http://100.101.2.3:18792")
+        assertThat(RemoteBridgeClient.validateEndpoint("http://my-mac.local:18792")).isEqualTo("http://my-mac.local:18792")
+        assertThat(RemoteBridgeClient.validateEndpoint("https://bridge.example.com")).isEqualTo("https://bridge.example.com")
+        // Block cleartext HTTP to public internet hosts/IPs!
+        assertThrows(BridgeException::class.java) { RemoteBridgeClient.validateEndpoint("http://8.8.8.8:18792") }
+        assertThrows(BridgeException::class.java) { RemoteBridgeClient.validateEndpoint("http://bridge.example.com:18792") }
+
+        // Exec and DSH delegation always require confirmation
+        val bridge = RemoteBridgeClient(config = { BridgeConfig(true, "http://127.0.0.1:18792", "", "0123456789abcdef0123456789abcdef") })
+        assertThat(BridgeExecTool(bridge).risk.needsConfirm(false)).isTrue()
+        assertThat(DshDelegateTool(bridge).risk.needsConfirm(false)).isTrue()
+        val dshStatus = DshStatusTool(bridge)
+        assertThat(dshStatus.riskFor(Json.parseToJsonElement("""{"action":"poll"}""").jsonObject)).isEqualTo(Risk.READ)
+        assertThat(dshStatus.riskFor(Json.parseToJsonElement("""{"action":"cancel"}""").jsonObject)).isEqualTo(Risk.REVERSIBLE)
     }
 }

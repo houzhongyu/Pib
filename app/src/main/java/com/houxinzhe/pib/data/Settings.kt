@@ -109,6 +109,33 @@ class Settings(context: Context) {
         get() = secrets.get(SecureStore.AMAP_KEY)
         set(v) = secrets.put(SecureStore.AMAP_KEY, v)
 
+    // ---- Remote Computer & DSH Bridge (optional) ----
+    var bridgeEnabled: Boolean
+        get() = p.getBoolean("bridge_enabled", false)
+        set(v) = p.edit().putBoolean("bridge_enabled", v).apply()
+    var bridgeUrl: String
+        get() = p.getString("bridge_url", "")!!
+        set(v) = p.edit().putString("bridge_url", v.trim()).apply()
+    var bridgeFallbackUrl: String
+        get() = p.getString("bridge_fallback_url", "")!!
+        set(v) = p.edit().putString("bridge_fallback_url", v.trim()).apply()
+    var bridgeDefaultCwd: String
+        get() = p.getString("bridge_cwd", "")!!
+        set(v) = p.edit().putString("bridge_cwd", v.trim()).apply()
+    var bridgeToken: String
+        get() = secrets.get(SecureStore.BRIDGE_TOKEN)
+        set(v) = secrets.put(SecureStore.BRIDGE_TOKEN, v)
+
+    fun importBridgePairing(rawUri: String): Boolean {
+        val parsed = parseBridgePairingUri(rawUri) ?: return false
+        bridgeEnabled = true
+        bridgeUrl = parsed.url
+        if (parsed.fallback.isNotBlank()) bridgeFallbackUrl = parsed.fallback
+        if (parsed.cwd.isNotBlank()) bridgeDefaultCwd = parsed.cwd
+        bridgeToken = parsed.token
+        return true
+    }
+
     /** Display name for the composer, e.g. "DeepSeek Flash". */
     val modelDisplayName: String get() = when {
         model == "deepseek-flash" -> "DeepSeek Flash"
@@ -149,5 +176,23 @@ class Settings(context: Context) {
             "zhipu" -> if (current == "glm-4-flash") "glm-4-plus" else "glm-4-flash"
             else -> current
         }
+
+        fun parseBridgePairingUri(raw: String): BridgePairing? = runCatching {
+            val uri = java.net.URI(raw.trim())
+            val scheme = uri.scheme?.lowercase() ?: return null
+            val host = uri.host?.lowercase() ?: return null
+            if (scheme != "pib" || host != "pair-bridge") return null
+            val params = uri.rawQuery.orEmpty().split('&').mapNotNull { kv ->
+                val idx = kv.indexOf('=')
+                if (idx <= 0) null
+                else java.net.URLDecoder.decode(kv.substring(0, idx), "UTF-8") to java.net.URLDecoder.decode(kv.substring(idx + 1), "UTF-8")
+            }.toMap()
+            val url = params["url"]?.trim().orEmpty()
+            val token = params["token"]?.trim().orEmpty()
+            if (url.isEmpty() || token.length < 16) return null
+            BridgePairing(url = url, token = token, fallback = params["fallback"]?.trim().orEmpty(), cwd = params["cwd"]?.trim().orEmpty())
+        }.getOrNull()
     }
 }
+
+data class BridgePairing(val url: String, val token: String, val fallback: String = "", val cwd: String = "")

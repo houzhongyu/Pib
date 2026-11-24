@@ -29,6 +29,7 @@ import androidx.core.content.ContextCompat
 import com.houxinzhe.pib.ui.AboutPage
 import com.houxinzhe.pib.ui.AllowlistPage
 import com.houxinzhe.pib.ui.AssistantScreen
+import com.houxinzhe.pib.ui.BridgePage
 import com.houxinzhe.pib.ui.ButlerPage
 import com.houxinzhe.pib.ui.CompanionScreen
 import com.houxinzhe.pib.ui.ConfirmDialog
@@ -88,6 +89,7 @@ class MainActivity : ComponentActivity() {
                             Page.TOOLS -> ToolsPage(vm)
                             Page.ALLOWLIST -> AllowlistPage(vm)
                             Page.BUTLER -> ButlerPage(vm)
+                            Page.BRIDGE -> BridgePage(vm)
                             Page.ABOUT -> AboutPage(vm)
                             null -> {}
                         }
@@ -108,6 +110,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleShare(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_VIEW) {
+            val dataStr = intent.dataString.orEmpty()
+            if (vm.settings.importBridgePairing(dataStr)) {
+                vm.touch()
+                vm.page = Page.BRIDGE
+                android.widget.Toast.makeText(this, "已导入远程电脑与 DSH 桥配对配置", android.widget.Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
         if (intent?.action == Intent.ACTION_SEND) {
             intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }?.let { shared ->
                 vm.page = null

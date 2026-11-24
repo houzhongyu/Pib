@@ -13,12 +13,18 @@ import com.houxinzhe.pib.llm.LlmConfig
 import com.houxinzhe.pib.tools.AlarmSetTool
 import com.houxinzhe.pib.tools.AmapClient
 import com.houxinzhe.pib.tools.AppHandoffTool
+import com.houxinzhe.pib.tools.BridgeConfig
+import com.houxinzhe.pib.tools.BridgeExecTool
+import com.houxinzhe.pib.tools.BridgeStatusTool
 import com.houxinzhe.pib.tools.CalendarAddTool
 import com.houxinzhe.pib.tools.CalendarListTool
+import com.houxinzhe.pib.tools.DshDelegateTool
+import com.houxinzhe.pib.tools.DshStatusTool
 import com.houxinzhe.pib.tools.ParcelAddTool
 import com.houxinzhe.pib.tools.ParcelDoneTool
 import com.houxinzhe.pib.tools.ParcelListTool
 import com.houxinzhe.pib.tools.PlaceSearchTool
+import com.houxinzhe.pib.tools.RemoteBridgeClient
 import com.houxinzhe.pib.tools.RoutePlanTool
 import com.houxinzhe.pib.tools.ScreenActTool
 import com.houxinzhe.pib.tools.ScreenReadTool
@@ -34,6 +40,7 @@ class PibApp : Application() {
     lateinit var threads: ThreadStore; private set
     lateinit var tasks: TaskStore; private set
     lateinit var butler: ButlerStore; private set
+    lateinit var bridge: RemoteBridgeClient; private set
     lateinit var registry: ToolRegistry; private set
     lateinit var agent: Agent; private set
 
@@ -44,6 +51,17 @@ class PibApp : Application() {
         tasks = TaskStore(File(filesDir, "tasks/ledger.json"))
         butler = ButlerStore(File(filesDir, "butler/items.json"))
         val amap = AmapClient(key = { settings.amapKey })
+        bridge = RemoteBridgeClient(
+            config = {
+                BridgeConfig(
+                    enabled = settings.bridgeEnabled,
+                    primaryUrl = settings.bridgeUrl,
+                    fallbackUrl = settings.bridgeFallbackUrl,
+                    token = settings.bridgeToken,
+                    defaultCwd = settings.bridgeDefaultCwd,
+                )
+            }
+        )
         registry = ToolRegistry(
             listOf(
                 AlarmSetTool(), TimerSetTool(),
@@ -53,6 +71,8 @@ class PibApp : Application() {
                 TripAddTool(butler), TripListTool(butler),
                 AppHandoffTool(),
                 ScreenReadTool(), ScreenActTool(),
+                BridgeStatusTool(bridge), BridgeExecTool(bridge),
+                DshDelegateTool(bridge), DshStatusTool(bridge),
             )
         )
         val llm = LlmClient { LlmConfig(settings.baseUrl, settings.llmKey, settings.model, settings.thinkingTier) }

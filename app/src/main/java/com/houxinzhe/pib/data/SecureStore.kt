@@ -57,5 +57,6 @@ class SecureStore(context: Context) {
         private const val IV_LEN = 12
         const val LLM_KEY = "llm_api_key"
         const val AMAP_KEY = "amap_web_key"
+        const val BRIDGE_TOKEN = "bridge_token"
     }
 }

@@ -37,6 +37,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBackIos
 import androidx.compose.material.icons.automirrored.outlined.ListAlt
 import androidx.compose.material.icons.outlined.Cancel
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Computer
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.LocalShipping
 import androidx.compose.material.icons.outlined.Mic
@@ -92,11 +93,12 @@ private data class Destination(val title: String, val keywords: String, val icon
 
 private val destinations = listOf(
     Destination("生活管家", "快递 取件码 驿站 丰巢 高铁 火车 12306 航班 飞机 车票", Icons.Outlined.LocalShipping, Color(0xFF007AFF), Page.BUTLER),
+    Destination("远程电脑与 DSH", "电脑 Mac PC DSH Codex 远程 编程 脚本 桥接", Icons.Outlined.Computer, Color(0xFF00C7BE), Page.BRIDGE),
     Destination("任务记录", "回执 执行 历史 日志 待核对", Icons.AutoMirrored.Outlined.ListAlt, Color(0xFFFF9F0A), Page.TASKS),
     Destination("工具权限", "工具 权限 授权 能力 闹钟 日历 高德 受限设置 通知", Icons.Outlined.Tune, Color(0xFF30D158), Page.TOOLS),
     Destination("无障碍白名单", "无障碍 屏幕 代操作 白名单 熔断 安全", Icons.Outlined.Shield, Color(0xFF5E5CE6), Page.ALLOWLIST),
     Destination("设置", "模型 key 余额 高德 名字 城市 朗读 安全", Icons.Outlined.Settings, Color(0xFF8E8E93), Page.SETTINGS),
-    Destination("关于与隐私", "许可证 源码 版本 隐私 用户协议 安装", Icons.Outlined.Info, Color(0xFFAF52DE), Page.ABOUT),
+    Destination("关于与隐私", "许可证 源码 版本 隐私 用户协议 安装 映迹", Icons.Outlined.Info, Color(0xFFAF52DE), Page.ABOUT),
 )
 
 /** 更多 = iOS DailyMoreView: two-column cards + bottom search capsule. */
@@ -558,6 +560,91 @@ fun AllowlistPage(vm: PibViewModel) {
                     }
                 }
             }
+        }
+        Spacer(Modifier.height(30.dp))
+    }
+}
+
+// ---------- Remote Computer & DSH Bridge Page ----------
+
+@Composable
+fun BridgePage(vm: PibViewModel) {
+    val s = vm.settings
+    val p = LocalPalette.current
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var enabled by remember { mutableStateOf(s.bridgeEnabled) }
+    var url by remember { mutableStateOf(s.bridgeUrl) }
+    var fallback by remember { mutableStateOf(s.bridgeFallbackUrl) }
+    var token by remember { mutableStateOf(s.bridgeToken) }
+    var cwd by remember { mutableStateOf(s.bridgeDefaultCwd) }
+    var status by remember { mutableStateOf<String?>(null) }
+
+    fun save() {
+        s.bridgeEnabled = enabled
+        s.bridgeUrl = url
+        s.bridgeFallbackUrl = fallback
+        s.bridgeToken = token
+        s.bridgeDefaultCwd = cwd
+        vm.touch()
+    }
+
+    PageScaffold("远程电脑与 DSH 桥", onBack = { save(); vm.page = null }) {
+        Group("快速配对", footer = "在你的 Mac / Windows / Linux 终端运行仓库内的 python3 bridge/pib_bridge.py，复制输出的 pib://pair-bridge?... 链接，点下方按钮一键导入即可。") {
+            SwitchRow("启用远程电脑与 DSH 桥", enabled) { enabled = it; save() }
+            Divider()
+            LinkRow("从剪贴板粘贴 pib:// 配对链接") {
+                val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                val raw = cm.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString().orEmpty()
+                if (s.importBridgePairing(raw)) {
+                    enabled = s.bridgeEnabled; url = s.bridgeUrl; fallback = s.bridgeFallbackUrl
+                    token = s.bridgeToken; cwd = s.bridgeDefaultCwd; vm.touch()
+                    status = "已成功导入配对配置，点下方「测试电脑与 DSH 连接」验证。"
+                } else {
+                    status = "剪贴板里不是有效的 pib://pair-bridge 配对链接。"
+                }
+            }
+        }
+
+        Group("连接参数", footer = "令牌用 Android Keystore 加密保存。为保护令牌安全，仅局域网 IP、Tailscale（100.x）或 .local 允许 http://，公网地址必须走 https://。") {
+            FieldRow("主地址", url, { url = it }, "http://192.168.x.x:18792")
+            Divider(); FieldRow("备用地址", fallback, { fallback = it }, "如 Tailscale 地址，可空")
+            Divider(); FieldRow("配对令牌", token, { token = it }, "粘贴 64 位十六进制令牌", secret = true)
+            Divider(); FieldRow("默认目录", cwd, { cwd = it }, "留空用电脑默认工作区")
+            Divider()
+            Row(
+                Modifier.fillMaxWidth().clickable {
+                    enabled = true; save(); status = "正在连接电脑…"
+                    scope.launch {
+                        status = runCatching {
+                            val h = vm.bridge.health()
+                            val host = h["hostname"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
+                            val ram = h["available_ram_gb"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
+                            val agents = (h["agents"] as? kotlinx.serialization.json.JsonArray)?.joinToString(",") { (it as kotlinx.serialization.json.JsonPrimitive).content }.orEmpty()
+                            "已连接 $host（可用内存 ${ram}GB · 引擎：${agents.ifBlank { "Python/Shell" }}）"
+                        }.getOrElse { "失败：${it.message}" }
+                    }
+                }.heightIn(min = 44.dp).padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("测试电脑与 DSH 连接", color = p.blue, fontSize = 17.sp)
+            }
+            status?.let {
+                Divider()
+                Text(it, color = if (it.startsWith("已连接")) p.green else p.secondaryLabel, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
+            }
+        }
+
+        Group("支持的能力与安全边界") {
+            Text(
+                "• 查看电脑状态（只读）：一句话查电脑可用内存、磁盘、Git 分支状态或最新日志。\n" +
+                    "• 委派 DSH / Codex 编程任务（逐次确认）：把代码检索、重构、跑单测、长日志排查通过 /dsh 交给电脑上的 DSH / Codex / Claude CLI 后台异步执行，随时轮询回执。\n" +
+                    "• 运行脚本或命令（逐次确认）：每次在手机弹窗确认工作目录与具体代码后才执行，电脑端内置目录白名单与高危命令拦截。",
+                color = p.label,
+                fontSize = 14.sp,
+                lineHeight = 21.sp,
+                modifier = Modifier.padding(16.dp),
+            )
         }
         Spacer(Modifier.height(30.dp))
     }

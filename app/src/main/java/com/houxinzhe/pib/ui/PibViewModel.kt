@@ -49,13 +49,14 @@ sealed interface Bubble {
 }
 
 enum class Tab { HOME, COMPANION, MORE }
-enum class Page { SETTINGS, TASKS, TOOLS, ALLOWLIST, BUTLER, ABOUT }
+enum class Page { SETTINGS, TASKS, TOOLS, ALLOWLIST, BUTLER, BRIDGE, ABOUT }
 
 class PibViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as PibApp
     val settings get() = app.settings
     val registry get() = app.registry
     val butler get() = app.butler
+    val bridge get() = app.bridge
 
     private val speaker = PibSpeaker(application)
 

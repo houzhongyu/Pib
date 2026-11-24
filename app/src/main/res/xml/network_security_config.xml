@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Socket-level cleartext is allowed ONLY so LAN / Tailscale / .local HTTP bridges work;
+         RemoteBridgeClient.validateEndpoint() strictly blocks cleartext HTTP to public internet hosts. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

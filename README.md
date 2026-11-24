@@ -4,11 +4,12 @@
 
 - **自带 Key（BYOK）、零后台服务器：** 模型 Key 与高德 Key 用 Android Keystore 硬件加密保存在手机本机，排除在系统云备份外；对话直连你所选的模型服务商。
 - **国内主流模型开箱即用：** 内置 DeepSeek（默认 `deepseek-flash` V4.1 Flash，含 5 档推理强度滑杆与 `⇄` 双模型快切、实时余额显示）、通义千问、智谱 GLM、Kimi、硅基流动及任意 OpenAI 兼容接口；支持照片识图与 1 MB 内 UTF-8 文本/代码附件。
-- **可审计回执与硬安全边界：** 15 个内置工具按四级风险（只读 / 可撤销 / 不可撤销 / 涉及钱或社交）管控，涉及花钱、打车、拨号与屏幕点击必弹窗确认；执行中断自动标为「结果待核对」，绝不谎报「已办好」。
+- **可审计回执与硬安全边界：** 19 个内置工具按四级风险（只读 / 可撤销 / 不可撤销 / 涉及钱或社交）管控，涉及花钱、打车、拨号、远程执行与屏幕点击必弹窗确认；执行中断自动标为「结果待核对」，绝不谎报「已办好」。
+- **远程电脑与 DSH / Codex 桥（跨平台零依赖守护端）：** 仓库附带单文件 [`bridge/pib_bridge.py`](bridge/pib_bridge.py)（支持 macOS / Linux / Windows），256-bit Bearer 令牌鉴权 + 工作区白名单，支持在手机上一句话查电脑状态、跑 Python/Node/命令，或把复杂编程排查异步委派给电脑上的 **DSH / Codex / Claude CLI**。
 
-> 当前版本 `0.2.0`。买家安装与安卓 13+ 受限设置解锁说明见 [INSTALL_CN.md](INSTALL_CN.md)，首发实拍脚本见 [VIDEO_SCRIPT.md](VIDEO_SCRIPT.md)。
+> 当前版本 `0.3.0`。买家安装与安卓 13+ 受限设置解锁说明见 [INSTALL_CN.md](INSTALL_CN.md)，首发实拍脚本见 [VIDEO_SCRIPT.md](VIDEO_SCRIPT.md)。
 
-## 内置 15 项工具与风险分级
+## 内置 19 项工具与风险分级
 
 | 领域 | 工具 | 例句 | 风险级别 |
 |---|---|---|---|
@@ -18,6 +19,17 @@
 | 生活管家 | `parcel_add`, `parcel_list`, `parcel_done`, `trip_add`, `trip_list` | 粘贴驿站或 12306/航旅短信自动提取取件码、车次检票口并写日历 | 可撤销 / 只读 |
 | 国内应用交接 | `app_handoff` | 「去美团搜拿铁」「打开高德打车去虹桥火车站」「去淘宝搜充电宝」 | 可撤销 / 涉及钱或社交 |
 | 白名单屏幕辅助 | `screen_read`, `screen_act` | 仅限用户勾选的普通工具应用；微信/支付宝/银行/密码验证码页硬熔断 | 只读 / 不可撤销 |
+| 远程电脑与 DSH 桥 | `bridge_status`, `bridge_exec`, `dsh_delegate`, `dsh_status` | 「看看我电脑内存和 Git 状态」「把这段重构任务交给电脑 DSH/Codex 跑」 | 只读 / 不可撤销 / 涉及钱或社交 |
+
+## 连接你的电脑与 DSH / Codex（可选）
+
+在你的 Mac / Linux / Windows 终端运行（仅依赖 Python 3.10+ 标准库）：
+
+```sh
+python3 bridge/pib_bridge.py
+```
+
+终端会输出一条 `pib://pair-bridge?url=...&token=...` 配对链接。复制后在手机 Pib 打开 **「更多 → 远程电脑与 DSH」**，点 **「从剪贴板粘贴 pib:// 配对链接」** 即可一键完成加密配对（局域网与 Tailscale `100.x` 直连支持 `http://`，公网穿透强制要求 `https://`）。
 
 ## 从源码构建与签名
 
@@ -34,6 +46,7 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 
 - [x] 0.1 Agent 核心、BYOK Keystore 加密、系统闹钟与日历、高德路线/打车估价/天气
 - [x] 0.2 iOS 同款三栏与侧栏界面、5 档推理滑杆、多模态照片/文件附件、语音听写与朗读、消息长按菜单、账户余额、免 Key 全国天气回退、快递取件码与 12306/航班管家、17 类国内 App 深链交接表、带三道硬熔断的白名单无障碍辅助、正式 Release 签名
+- [x] 0.3 跨平台远程电脑与 DSH / Codex 异步编程桥（`bridge/pib_bridge.py` + 手机端一键配对、只读查状态、逐次授权脚本执行、DSH/Codex 后台任务委派与进度轮询）
 
 ## 作者与许可证
 

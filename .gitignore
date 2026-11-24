@@ -23,3 +23,7 @@ secrets/
 *.iml
 .DS_Store
 releases/
+
+# Python
+__pycache__/
+*.pyc
