@@ -32,13 +32,14 @@ class PibAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    fun readAllowedScreen(allowlist: Set<String>): ToolResult {
+    fun readAllowedScreen(allowlist: Set<String>, extraBlocked: Set<String> = emptySet()): ToolResult {
         val root = rootInActiveWindow ?: return ToolResult.fail("当前拿不到活动窗口内容。")
         val pkg = root.packageName?.toString().orEmpty()
+        val peerPkgs = SafetyFuse.peerAccessibilityPackages(this)
         val nodes = mutableListOf<AccessibilityNodeInfo>()
         val summaries = mutableListOf<UiNodeSummary>()
         collectNodes(root, nodes, summaries, maxNodes = 60)
-        return when (val v = SafetyFuse.check(pkg, allowlist, summaries)) {
+        return when (val v = SafetyFuse.check(pkg, allowlist, summaries, extraBlocked = extraBlocked, peerA11yPackages = peerPkgs)) {
             is FuseVerdict.Blocked -> ToolResult.fail(v.reason)
             FuseVerdict.Allowed -> {
                 if (summaries.isEmpty()) ToolResult.ok("前台应用 $pkg 当前没有可读的文字控件。")
@@ -54,14 +55,21 @@ class PibAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun actOnAllowedScreen(action: String, target: String?, text: String?, allowlist: Set<String>): ToolResult {
+    fun actOnAllowedScreen(
+        action: String,
+        target: String?,
+        text: String?,
+        allowlist: Set<String>,
+        extraBlocked: Set<String> = emptySet(),
+    ): ToolResult {
+        val peerPkgs = SafetyFuse.peerAccessibilityPackages(this)
         if (action == "back") {
             val root = rootInActiveWindow ?: return ToolResult.fail("当前拿不到活动窗口。")
             val pkg = root.packageName?.toString().orEmpty()
             val nodes = mutableListOf<AccessibilityNodeInfo>()
             val summaries = mutableListOf<UiNodeSummary>()
             collectNodes(root, nodes, summaries, maxNodes = 60)
-            val v = SafetyFuse.check(pkg, allowlist, summaries)
+            val v = SafetyFuse.check(pkg, allowlist, summaries, extraBlocked = extraBlocked, peerA11yPackages = peerPkgs)
             if (v is FuseVerdict.Blocked) return ToolResult.fail(v.reason)
             return if (performGlobalAction(GLOBAL_ACTION_BACK)) ToolResult.ok("已在 $pkg 执行返回。")
             else ToolResult.fail("系统拒绝执行返回。")
@@ -72,7 +80,7 @@ class PibAccessibilityService : AccessibilityService() {
         val nodes = mutableListOf<AccessibilityNodeInfo>()
         val summaries = mutableListOf<UiNodeSummary>()
         collectNodes(root, nodes, summaries, maxNodes = 80)
-        val verdict = SafetyFuse.check(pkg, allowlist, summaries)
+        val verdict = SafetyFuse.check(pkg, allowlist, summaries, extraBlocked = extraBlocked, peerA11yPackages = peerPkgs)
         if (verdict is FuseVerdict.Blocked) return ToolResult.fail(verdict.reason)
 
         return when (action) {

@@ -117,6 +117,9 @@ fun AssistantScreen(vm: PibViewModel) {
     val focus = LocalFocusManager.current
     var explains by remember { mutableStateOf(false) }
     var draft by rememberSaveable { mutableStateOf("") }
+    LaunchedEffect(vm.sharedDraft) {
+        vm.consumeSharedDraft()?.let { incoming -> draft = incoming }
+    }
     val rev = vm.revision
     val turns = remember(rev, vm.homeKey, vm.temporary) { vm.homeTurns() }
     val busy = vm.busyKey != null && vm.busyKey == vm.homeKey
@@ -160,6 +163,8 @@ fun AssistantScreen(vm: PibViewModel) {
                 onTextChange = { draft = it },
                 followUp = turns.isNotEmpty(),
             )
+        } else {
+            StopGenerationBar(onStop = { vm.stopGeneration() })
         }
     }
     if (explains) TemporaryChatInfo { explains = false }
@@ -220,10 +225,18 @@ private fun TurnList(
             }
         }
         if (pending != null) item {
+            val streamed = vm.streamingText
             TurnView(pending, null, caption) {
+                if (!streamed.isNullOrBlank()) {
+                    Text(streamed, color = p.label, fontSize = 16.sp, lineHeight = 23.sp, modifier = Modifier.fillMaxWidth())
+                }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     CircularProgressIndicator(Modifier.size(16.dp), color = p.secondaryLabel, strokeWidth = 2.dp)
-                    Text(vm.progress ?: "处理中", color = p.secondaryLabel, fontSize = 15.sp)
+                    Text(
+                        if (!streamed.isNullOrBlank()) "生成中…" else (vm.progress ?: "处理中"),
+                        color = p.secondaryLabel,
+                        fontSize = 15.sp,
+                    )
                 }
             }
         }
@@ -530,6 +543,27 @@ private fun TemporaryChatInfo(onDismiss: () -> Unit) {
 }
 
 @Composable
+fun StopGenerationBar(onStop: () -> Unit) {
+    val p = LocalPalette.current
+    Box(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp), contentAlignment = Alignment.Center) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+                .clip(CircleShape)
+                .background(p.secondaryBackground)
+                .border(0.7.dp, p.separator.copy(alpha = 0.65f), CircleShape)
+                .clickable(onClick = onStop)
+                .padding(horizontal = 18.dp, vertical = 10.dp)
+                .semantics { contentDescription = "停止生成" },
+        ) {
+            Box(Modifier.size(11.dp).clip(RoundedCornerShape(2.5.dp)).background(p.label))
+            Text("停止生成", color = p.label, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
+@Composable
 fun ConfirmDialog(req: ConfirmRequest, answer: (Boolean) -> Unit) {
     val p = LocalPalette.current
     val strong = req.risk == Risk.SENSITIVE || req.risk == Risk.IRREVERSIBLE
@@ -545,5 +579,38 @@ fun ConfirmDialog(req: ConfirmRequest, answer: (Boolean) -> Unit) {
         },
         confirmButton = { TextButton(onClick = { answer(true) }) { Text("执行", color = p.blue, fontWeight = FontWeight.SemiBold) } },
         dismissButton = { TextButton(onClick = { answer(false) }) { Text("不要", color = p.blue) } },
+    )
+}
+
+@Composable
+fun BridgePairConfirmDialog(req: PendingBridgePair, answer: (Boolean) -> Unit) {
+    val p = LocalPalette.current
+    AlertDialog(
+        onDismissRequest = { answer(false) },
+        containerColor = if (p.dark) Color(0xFF2C2C2E) else Color(0xFFF2F2F2),
+        title = { Text("确认配对远程电脑桥", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = p.label) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("请确认该配对链接确实来自你自己的电脑终端：", fontSize = 14.sp, color = p.secondaryLabel)
+                Text("主地址：${req.pairing.url}", fontSize = 14.sp, color = p.label, fontWeight = FontWeight.Medium)
+                if (req.pairing.fallback.isNotBlank()) {
+                    Text("备用地址：${req.pairing.fallback}", fontSize = 13.sp, color = p.secondaryLabel)
+                }
+                if (req.pairing.cwd.isNotBlank()) {
+                    Text("默认目录：${req.pairing.cwd}", fontSize = 13.sp, color = p.secondaryLabel)
+                }
+                Text("令牌指纹：${req.fingerprint}", fontSize = 13.sp, color = p.secondaryLabel)
+                if (req.replacesExisting) {
+                    Text(
+                        "警告：这将覆盖当前已配置的电脑桥（${req.previousUrl.ifBlank { "已有令牌" }}）！若你并未主动发起配对，请立即点「拒绝」。",
+                        fontSize = 13.sp,
+                        color = p.red,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { answer(true) }) { Text("确认配对", color = p.blue, fontWeight = FontWeight.SemiBold) } },
+        dismissButton = { TextButton(onClick = { answer(false) }) { Text("拒绝", color = p.red) } },
     )
 }

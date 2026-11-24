@@ -1,6 +1,8 @@
 package com.houxinzhe.pib.data
 
 import android.content.Context
+import com.houxinzhe.pib.llm.EndpointSecurity
+import java.security.MessageDigest
 
 /** OpenAI-compatible providers available in mainland China. Users bring their own key. */
 data class ProviderPreset(val id: String, val label: String, val baseUrl: String, val model: String, val keyUrl: String)
@@ -95,6 +97,24 @@ class Settings(context: Context) {
         get() = p.getStringSet("a11y_allowlist", null)?.toSet() ?: DEFAULT_ALLOWED_PACKAGES
         set(v) = p.edit().putStringSet("a11y_allowlist", v.toSet()).apply()
 
+    /** On-device user-added hard-blocked packages that can never be checked in the allowlist. */
+    var customBlockedPackages: Set<String>
+        get() = p.getStringSet("custom_blocked_pkgs", emptySet())?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }?.toSet() ?: emptySet()
+        set(v) = p.edit().putStringSet("custom_blocked_pkgs", v.map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()).apply()
+
+    fun addCustomBlockedPackage(pkg: String): Boolean {
+        val clean = pkg.trim().lowercase()
+        if (!PACKAGE_NAME_REGEX.matches(clean)) return false
+        customBlockedPackages = customBlockedPackages + clean
+        accessibilityAllowlist = accessibilityAllowlist.filterNot { it.equals(clean, ignoreCase = true) }.toSet()
+        return true
+    }
+
+    fun removeCustomBlockedPackage(pkg: String) {
+        val clean = pkg.trim().lowercase()
+        customBlockedPackages = customBlockedPackages - clean
+    }
+
     fun swapModel() {
         val cur = model
         val next = altModel.takeIf { it.isNotBlank() && it != cur } ?: defaultAltModel(providerId, cur)
@@ -126,13 +146,17 @@ class Settings(context: Context) {
         get() = secrets.get(SecureStore.BRIDGE_TOKEN)
         set(v) = secrets.put(SecureStore.BRIDGE_TOKEN, v)
 
-    fun importBridgePairing(rawUri: String): Boolean {
-        val parsed = parseBridgePairingUri(rawUri) ?: return false
+    fun applyBridgePairing(parsed: BridgePairing) {
         bridgeEnabled = true
         bridgeUrl = parsed.url
-        if (parsed.fallback.isNotBlank()) bridgeFallbackUrl = parsed.fallback
+        bridgeFallbackUrl = parsed.fallback
         if (parsed.cwd.isNotBlank()) bridgeDefaultCwd = parsed.cwd
         bridgeToken = parsed.token
+    }
+
+    fun importBridgePairing(rawUri: String): Boolean {
+        val parsed = parseBridgePairingUri(rawUri) ?: return false
+        applyBridgePairing(parsed)
         return true
     }
 
@@ -154,6 +178,8 @@ class Settings(context: Context) {
     val isLlmReady: Boolean get() = llmKey.isNotBlank() && baseUrl.isNotBlank() && model.isNotBlank()
 
     companion object {
+        private val PACKAGE_NAME_REGEX = Regex("^[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+$")
+
         val DEFAULT_ALLOWED_PACKAGES = setOf(
             "com.android.BBKClock",
             "com.android.deskclock",
@@ -177,6 +203,14 @@ class Settings(context: Context) {
             else -> current
         }
 
+        fun tokenFingerprint(token: String): String {
+            val clean = token.trim()
+            if (clean.isEmpty()) return ""
+            val digest = MessageDigest.getInstance("SHA-256").digest(clean.toByteArray(Charsets.UTF_8))
+            val hex = digest.take(4).joinToString("") { "%02x".format(it) }
+            return "SHA256:$hex（尾号 …${clean.takeLast(4)}）"
+        }
+
         fun parseBridgePairingUri(raw: String): BridgePairing? = runCatching {
             val uri = java.net.URI(raw.trim())
             val scheme = uri.scheme?.lowercase() ?: return null
@@ -187,10 +221,12 @@ class Settings(context: Context) {
                 if (idx <= 0) null
                 else java.net.URLDecoder.decode(kv.substring(0, idx), "UTF-8") to java.net.URLDecoder.decode(kv.substring(idx + 1), "UTF-8")
             }.toMap()
-            val url = params["url"]?.trim().orEmpty()
+            val url = EndpointSecurity.validateUrl(params["url"]?.trim().orEmpty(), "电脑桥地址")
+            val fallbackRaw = params["fallback"]?.trim().orEmpty()
+            val fallback = if (fallbackRaw.isNotEmpty()) EndpointSecurity.validateUrl(fallbackRaw, "备用地址") else ""
             val token = params["token"]?.trim().orEmpty()
             if (url.isEmpty() || token.length < 16) return null
-            BridgePairing(url = url, token = token, fallback = params["fallback"]?.trim().orEmpty(), cwd = params["cwd"]?.trim().orEmpty())
+            BridgePairing(url = url, token = token, fallback = fallback, cwd = params["cwd"]?.trim().orEmpty())
         }.getOrNull()
     }
 }

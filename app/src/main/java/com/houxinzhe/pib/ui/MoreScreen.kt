@@ -508,30 +508,41 @@ fun ToolsPage(vm: PibViewModel) {
 
 // ---------- Accessibility Allowlist Page ----------
 
-private data class InstalledAppItem(val pkg: String, val label: String, val hardBlocked: Boolean)
+private data class InstalledAppItem(val pkg: String, val label: String, val hardBlocked: Boolean, val peerA11y: Boolean)
 
 @Composable
 fun AllowlistPage(vm: PibViewModel) {
     val p = LocalPalette.current
     val ctx = LocalContext.current
-    var allowlist by remember { mutableStateOf(vm.settings.accessibilityAllowlist) }
-    val apps = remember {
+    val rev = vm.revision
+    var allowlist by remember(rev) { mutableStateOf(vm.settings.accessibilityAllowlist) }
+    var customBlocked by remember(rev) { mutableStateOf(vm.settings.customBlockedPackages) }
+    var customInput by remember { mutableStateOf("") }
+    var customTip by remember { mutableStateOf<String?>(null) }
+
+    val peerPkgs = remember { SafetyFuse.peerAccessibilityPackages(ctx) }
+    val apps = remember(peerPkgs) {
         val pm = ctx.packageManager
         val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         pm.queryIntentActivities(main, 0)
             .map { ri ->
                 val pkg = ri.activityInfo.packageName
-                InstalledAppItem(pkg, ri.loadLabel(pm).toString(), SafetyFuse.isHardBlockedPackage(pkg))
+                InstalledAppItem(
+                    pkg = pkg,
+                    label = ri.loadLabel(pm).toString(),
+                    hardBlocked = SafetyFuse.isHardBlockedPackage(pkg),
+                    peerA11y = peerPkgs.any { it.equals(pkg, ignoreCase = true) },
+                )
             }
             .distinctBy { it.pkg }
-            .sortedWith(compareBy<InstalledAppItem> { it.hardBlocked }.thenBy { it.label })
+            .sortedWith(compareBy<InstalledAppItem> { it.hardBlocked || it.peerA11y }.thenBy { it.label })
     }
 
     PageScaffold("无障碍白名单", onBack = { vm.page = Page.TOOLS }) {
-        Group("硬熔断保护（永久禁止代操作）", footer = "为保护你的社交账号与资金安全，微信、支付宝、银行及主流电商外卖 App 永久禁止屏幕代操作；Pib 对这些应用只使用官方深链预填跳转。") {
-            val blocked = apps.filter { it.hardBlocked }
+        Group("硬熔断保护（永久禁止代操作）", footer = "为保护社交账号、密码库与资金安全，微信、支付宝、银行、超级 App 以及手机上其他正在运行的无障碍服务应用均自动熔断，互不干扰。") {
+            val blocked = apps.filter { it.hardBlocked || it.peerA11y }
             if (blocked.isEmpty()) {
-                Text("微信、支付宝、银行及系统权限页均已内置硬熔断保护。", color = p.secondaryLabel, fontSize = 14.sp, modifier = Modifier.padding(16.dp))
+                Text("微信、支付宝、银行、密码库及系统权限页均已内置硬熔断保护。", color = p.secondaryLabel, fontSize = 14.sp, modifier = Modifier.padding(16.dp))
             } else {
                 blocked.forEachIndexed { i, a ->
                     if (i > 0) Divider()
@@ -540,14 +551,47 @@ fun AllowlistPage(vm: PibViewModel) {
                             Text(a.label, color = p.secondaryLabel, fontSize = 16.sp)
                             Text(a.pkg, color = p.tertiaryLabel, fontSize = 12.sp)
                         }
-                        Text("已熔断保护", color = p.red, fontSize = 13.sp)
+                        Text(if (a.peerA11y && !a.hardBlocked) "已熔断 · 无障碍服务" else "已熔断保护", color = p.red, fontSize = 13.sp)
                     }
                 }
             }
         }
 
+        Group("本机额外熔断名单", footer = "保存在手机本地，不上传；加入后该包名无法被勾选或自动化打开。") {
+            FieldRow("包名", customInput, { customInput = it }, "例如 com.example.app")
+            Divider()
+            LinkRow("加入本机熔断") {
+                if (vm.settings.addCustomBlockedPackage(customInput)) {
+                    customBlocked = vm.settings.customBlockedPackages
+                    allowlist = vm.settings.accessibilityAllowlist
+                    customTip = "已将 ${customInput.trim().lowercase()} 加入本机熔断保护。"
+                    customInput = ""
+                    vm.touch()
+                } else {
+                    customTip = "请输入有效的应用包名（如 com.example.app）。"
+                }
+            }
+            customTip?.let {
+                Divider()
+                Text(it, color = p.secondaryLabel, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            }
+            customBlocked.sorted().forEach { pkg ->
+                Divider()
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(pkg, color = p.label, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    Text("移除", color = p.blue, fontSize = 14.sp, modifier = Modifier.clickable {
+                        vm.settings.removeCustomBlockedPackage(pkg)
+                        customBlocked = vm.settings.customBlockedPackages
+                        vm.touch()
+                    })
+                }
+            }
+        }
+
         Group("可勾选加入白名单的普通应用") {
-            val candidates = apps.filterNot { it.hardBlocked }
+            val candidates = apps.filterNot { a ->
+                a.hardBlocked || a.peerA11y || customBlocked.any { it.equals(a.pkg, ignoreCase = true) }
+            }
             if (candidates.isEmpty()) {
                 Text("未读取到其他桌面应用。", color = p.secondaryLabel, fontSize = 14.sp, modifier = Modifier.padding(16.dp))
             } else {
@@ -573,11 +617,12 @@ fun BridgePage(vm: PibViewModel) {
     val p = LocalPalette.current
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    var enabled by remember { mutableStateOf(s.bridgeEnabled) }
-    var url by remember { mutableStateOf(s.bridgeUrl) }
-    var fallback by remember { mutableStateOf(s.bridgeFallbackUrl) }
-    var token by remember { mutableStateOf(s.bridgeToken) }
-    var cwd by remember { mutableStateOf(s.bridgeDefaultCwd) }
+    val rev = vm.revision
+    var enabled by remember(rev) { mutableStateOf(s.bridgeEnabled) }
+    var url by remember(rev) { mutableStateOf(s.bridgeUrl) }
+    var fallback by remember(rev) { mutableStateOf(s.bridgeFallbackUrl) }
+    var token by remember(rev) { mutableStateOf(s.bridgeToken) }
+    var cwd by remember(rev) { mutableStateOf(s.bridgeDefaultCwd) }
     var status by remember { mutableStateOf<String?>(null) }
 
     fun save() {
@@ -590,25 +635,23 @@ fun BridgePage(vm: PibViewModel) {
     }
 
     PageScaffold("远程电脑与 DSH 桥", onBack = { save(); vm.page = null }) {
-        Group("快速配对", footer = "在你的 Mac / Windows / Linux 终端运行仓库内的 python3 bridge/pib_bridge.py，复制输出的 pib://pair-bridge?... 链接，点下方按钮一键导入即可。") {
+        Group("快速配对", footer = "在你的 Mac / Windows / Linux 终端运行仓库内的 python3 bridge/pib_bridge.py（同局域网 Wi-Fi 直连加 --lan），复制输出的 pib://pair-bridge?... 链接，点下方按钮核对指纹后导入。") {
             SwitchRow("启用远程电脑与 DSH 桥", enabled) { enabled = it; save() }
             Divider()
             LinkRow("从剪贴板粘贴 pib:// 配对链接") {
                 val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                 val raw = cm.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString().orEmpty()
-                if (s.importBridgePairing(raw)) {
-                    enabled = s.bridgeEnabled; url = s.bridgeUrl; fallback = s.bridgeFallbackUrl
-                    token = s.bridgeToken; cwd = s.bridgeDefaultCwd; vm.touch()
-                    status = "已成功导入配对配置，点下方「测试电脑与 DSH 连接」验证。"
+                if (vm.requestBridgePairing(raw)) {
+                    status = "请核对弹窗中的电脑地址与令牌指纹后点击「确认配对」。"
                 } else {
-                    status = "剪贴板里不是有效的 pib://pair-bridge 配对链接。"
+                    status = "剪贴板里不是有效的 pib://pair-bridge 配对链接（公网地址必须使用 https://）。"
                 }
             }
         }
 
-        Group("连接参数", footer = "令牌用 Android Keystore 加密保存。为保护令牌安全，仅局域网 IP、Tailscale（100.x）或 .local 允许 http://，公网地址必须走 https://。") {
-            FieldRow("主地址", url, { url = it }, "http://192.168.x.x:18792")
-            Divider(); FieldRow("备用地址", fallback, { fallback = it }, "如 Tailscale 地址，可空")
+        Group("连接参数", footer = "令牌经 Android Keystore 加密保存；局域网/Tailscale HTTP 请求全程使用 HMAC-SHA256 防重放签名，不传输明文令牌。公网地址强制要求 https://。") {
+            FieldRow("主地址", url, { url = it }, "http://100.x.x.x:18792 或 192.168.x.x")
+            Divider(); FieldRow("备用地址", fallback, { fallback = it }, "如 Tailscale / 局域网地址，可空")
             Divider(); FieldRow("配对令牌", token, { token = it }, "粘贴 64 位十六进制令牌", secret = true)
             Divider(); FieldRow("默认目录", cwd, { cwd = it }, "留空用电脑默认工作区")
             Divider()
@@ -621,7 +664,7 @@ fun BridgePage(vm: PibViewModel) {
                             val host = h["hostname"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
                             val ram = h["available_ram_gb"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
                             val agents = (h["agents"] as? kotlinx.serialization.json.JsonArray)?.joinToString(",") { (it as kotlinx.serialization.json.JsonPrimitive).content }.orEmpty()
-                            "已连接 $host（可用内存 ${ram}GB · 引擎：${agents.ifBlank { "Python/Shell" }}）"
+                            "已连接 $host（可用内存 ${ram}GB · 引擎：${agents.ifBlank { "Python/Node" }}）"
                         }.getOrElse { "失败：${it.message}" }
                     }
                 }.heightIn(min = 44.dp).padding(horizontal = 16.dp),
@@ -637,9 +680,9 @@ fun BridgePage(vm: PibViewModel) {
 
         Group("支持的能力与安全边界") {
             Text(
-                "• 查看电脑状态（只读）：一句话查电脑可用内存、磁盘、Git 分支状态或最新日志。\n" +
-                    "• 委派 DSH / Codex 编程任务（逐次确认）：把代码检索、重构、跑单测、长日志排查通过 /dsh 交给电脑上的 DSH / Codex / Claude CLI 后台异步执行，随时轮询回执。\n" +
-                    "• 运行脚本或命令（逐次确认）：每次在手机弹窗确认工作目录与具体代码后才执行，电脑端内置目录白名单与高危命令拦截。",
+                "• 查看电脑状态（只读）：查电脑可用内存、磁盘、Git 分支状态或最新日志。\n" +
+                    "• 委派 DSH / Codex 编程任务（逐次确认）：把代码检索、重构、跑单测交给电脑上的 DSH / Codex / Claude CLI 后台异步执行，支持幂等防重发与随时轮询/取消。\n" +
+                    "• 运行脚本或命令（逐次确认）：每次在手机弹窗确认目录与代码后才执行。注意：持有令牌即具备当前电脑账号下的脚本运行权限，内置目录白名单与高危命令拦截用于防误操作而非内核沙箱，请勿在不受信公共 Wi-Fi 开启 --lan。",
                 color = p.label,
                 fontSize = 14.sp,
                 lineHeight = 21.sp,

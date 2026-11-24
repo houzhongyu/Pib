@@ -68,14 +68,18 @@ fun CompanionScreen(vm: PibViewModel) {
     val focus = LocalFocusManager.current
     val ctx = LocalContext.current
     var draft by rememberSaveable { mutableStateOf("") }
+    LaunchedEffect(vm.companionRestoredDraft) {
+        vm.consumeCompanionRestoredDraft()?.let { restored -> draft = restored }
+    }
     val rev = vm.revision
     val bubbles = remember(rev) { vm.companionBubbles() }
     val busy = vm.busyKey == vm.companionKey
     val pending = vm.pending?.takeIf { it.first == vm.companionKey }?.second
+    val streamed = vm.streamingText?.takeIf { busy && it.isNotBlank() }
     val list = rememberLazyListState()
     val rows = bubbles + listOfNotNull(pending?.let { Bubble.Mine(-1, it) })
     val maxExIdx = bubbles.maxOfOrNull { it.exchangeIndex } ?: -1
-    LaunchedEffect(rows.size, busy) { if (rows.isNotEmpty()) list.animateScrollToItem(rows.size - 1 + if (busy) 1 else 0) }
+    LaunchedEffect(rows.size, busy, streamed != null) { if (rows.isNotEmpty()) list.animateScrollToItem(rows.size - 1 + if (busy) 1 else 0) }
 
     Column(Modifier.fillMaxSize().background(p.background).statusBarsPadding()) {
         Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -137,13 +141,27 @@ fun CompanionScreen(vm: PibViewModel) {
                 }
             }
             if (busy) item {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PibAvatar(34.dp)
-                    Text(vm.progress?.let { "正在$it" } ?: "正在输入…", color = p.secondaryLabel, fontSize = 13.sp)
+                if (streamed != null) {
+                    Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PibAvatar(34.dp)
+                        Text(
+                            streamed,
+                            color = p.label,
+                            fontSize = 16.sp,
+                            lineHeight = 22.sp,
+                            modifier = Modifier.widthIn(max = 270.dp).clip(RoundedCornerShape(20.dp)).background(p.secondaryBackground)
+                                .padding(horizontal = 13.dp, vertical = 9.dp),
+                        )
+                    }
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PibAvatar(34.dp)
+                        Text(vm.progress?.let { "正在$it" } ?: "正在输入…", color = p.secondaryLabel, fontSize = 13.sp)
+                    }
                 }
             }
         }
-        CompanionComposer(vm = vm, text = draft, onTextChange = { draft = it }, enabled = !busy)
+        CompanionComposer(vm = vm, text = draft, onTextChange = { draft = it }, busy = busy)
     }
 }
 
@@ -213,7 +231,7 @@ private fun MyBubble(text: String, attachmentName: String?, status: String?, onC
 
 /** 24pt capsule input: + menu (照片 / 文件 / 剪贴板), centred placeholder, speech or up-arrow send. */
 @Composable
-private fun CompanionComposer(vm: PibViewModel, text: String, onTextChange: (String) -> Unit, enabled: Boolean) {
+private fun CompanionComposer(vm: PibViewModel, text: String, onTextChange: (String) -> Unit, busy: Boolean) {
     val p = LocalPalette.current
     var plus by remember { mutableStateOf(false) }
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -233,8 +251,8 @@ private fun CompanionComposer(vm: PibViewModel, text: String, onTextChange: (Str
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box {
-                Box(Modifier.size(44.dp).clickable { plus = true }.semantics { contentDescription = "添加附件" }, contentAlignment = Alignment.Center) {
-                    Icon(Icons.Outlined.Add, null, tint = p.label)
+                Box(Modifier.size(44.dp).clickable(enabled = !busy) { plus = true }.semantics { contentDescription = "添加附件" }, contentAlignment = Alignment.Center) {
+                    Icon(Icons.Outlined.Add, null, tint = if (busy) p.secondaryLabel else p.label)
                 }
                 PlusMenu(
                     expanded = plus,
@@ -246,9 +264,15 @@ private fun CompanionComposer(vm: PibViewModel, text: String, onTextChange: (Str
             }
             Box(Modifier.weight(1f).padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
                 if (text.isEmpty()) Text("给 ${vm.settings.assistantName} 发消息", color = p.tertiaryLabel.copy(alpha = 0.9f), fontSize = 16.sp)
-                BasicTextField(text, onTextChange, maxLines = 5, textStyle = TextStyle(color = p.label, fontSize = 16.sp), cursorBrush = SolidColor(p.blue), modifier = Modifier.fillMaxWidth())
+                BasicTextField(text, onTextChange, enabled = !busy, maxLines = 5, textStyle = TextStyle(color = p.label, fontSize = 16.sp), cursorBrush = SolidColor(p.blue), modifier = Modifier.fillMaxWidth())
             }
-            if (!hasInput) {
+            if (busy) {
+                Box(Modifier.size(44.dp).clickable { vm.stopGeneration() }.semantics { contentDescription = "停止生成" }, contentAlignment = Alignment.Center) {
+                    Box(Modifier.size(32.dp).clip(CircleShape).background(p.secondaryBackground), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(11.dp).clip(RoundedCornerShape(2.5.dp)).background(p.label))
+                    }
+                }
+            } else if (!hasInput) {
                 Box(
                     Modifier.size(44.dp).clickable { speech.toggle() }
                         .semantics { contentDescription = if (speech.recording) "停止语音" else "语音输入" },
@@ -257,8 +281,8 @@ private fun CompanionComposer(vm: PibViewModel, text: String, onTextChange: (Str
                     if (speech.recording) WaveformGlyph(p.blue) else Icon(Icons.Outlined.Mic, null, tint = p.label)
                 }
             } else {
-                Box(Modifier.size(44.dp).clickable(enabled = enabled) { vm.sendCompanion(text); onTextChange("") }.semantics { contentDescription = "发送" }, contentAlignment = Alignment.Center) {
-                    Box(Modifier.size(32.dp).clip(CircleShape).background(if (enabled) p.blue else p.secondaryLabel), contentAlignment = Alignment.Center) {
+                Box(Modifier.size(44.dp).clickable { vm.sendCompanion(text); onTextChange("") }.semantics { contentDescription = "发送" }, contentAlignment = Alignment.Center) {
+                    Box(Modifier.size(32.dp).clip(CircleShape).background(p.blue), contentAlignment = Alignment.Center) {
                         Icon(Icons.Filled.ArrowUpward, null, tint = Color.White, modifier = Modifier.size(19.dp))
                     }
                 }

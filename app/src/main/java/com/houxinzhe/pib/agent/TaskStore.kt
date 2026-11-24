@@ -1,5 +1,6 @@
 package com.houxinzhe.pib.agent
 
+import com.houxinzhe.pib.data.AtomicFile
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -40,7 +41,8 @@ class TaskStore(private val file: File?) {
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
     private val tasks: MutableList<TaskRecord> = load()
 
-    val all: List<TaskRecord> get() = tasks.toList()
+    val all: List<TaskRecord>
+        @Synchronized get() = tasks.map { t -> t.copy(steps = t.steps.map { it.copy() }.toMutableList()) }
 
     private fun load(): MutableList<TaskRecord> {
         val f = file ?: return mutableListOf()
@@ -59,26 +61,42 @@ class TaskStore(private val file: File?) {
         return list
     }
 
-    fun begin(id: String, request: String): TaskRecord = TaskRecord(id, request).also { tasks.add(0, it); trim(); persist(tasks) }
+    @Synchronized
+    fun begin(id: String, request: String): TaskRecord =
+        TaskRecord(id, request).also { tasks.add(0, it); trim(); persist(tasks) }
 
-    fun startStep(task: TaskRecord, step: TaskStep) { task.steps.add(step); persist(tasks) }
-
-    fun endStep(task: TaskRecord, step: TaskStep, status: StepStatus, receipt: String) {
-        step.status = status; step.receipt = receipt; step.endedAt = System.currentTimeMillis()
+    @Synchronized
+    fun startStep(task: TaskRecord, step: TaskStep) {
+        task.steps.add(step)
         persist(tasks)
     }
 
-    fun finish(task: TaskRecord) { task.finished = true; persist(tasks) }
+    @Synchronized
+    fun endStep(task: TaskRecord, step: TaskStep, status: StepStatus, receipt: String) {
+        step.status = status
+        step.receipt = receipt
+        step.endedAt = System.currentTimeMillis()
+        persist(tasks)
+    }
 
-    fun clear() { tasks.clear(); persist(tasks) }
+    @Synchronized
+    fun finish(task: TaskRecord) {
+        task.finished = true
+        persist(tasks)
+    }
 
-    private fun trim() { while (tasks.size > 200) tasks.removeAt(tasks.lastIndex) }
+    @Synchronized
+    fun clear() {
+        tasks.clear()
+        persist(tasks)
+    }
+
+    private fun trim() {
+        while (tasks.size > 200) tasks.removeAt(tasks.lastIndex)
+    }
 
     private fun persist(list: List<TaskRecord>) {
         val f = file ?: return
-        f.parentFile?.mkdirs()
-        val tmp = File(f.parentFile, f.name + ".tmp")
-        tmp.writeText(json.encodeToString(list))
-        tmp.renameTo(f)
+        AtomicFile.writeText(f, json.encodeToString(list))
     }
 }

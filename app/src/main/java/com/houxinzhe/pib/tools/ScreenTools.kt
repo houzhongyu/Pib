@@ -23,7 +23,7 @@ class ScreenReadTool : Tool {
     override suspend fun run(args: JsonObject, ctx: ToolContext): ToolResult {
         val svc = PibAccessibilityService.instance
             ?: return ToolResult.fail("尚未开启 Pib 无障碍辅助服务。请让用户到「更多 → 工具权限」按指引开启（若遇安卓13+受限设置，先在系统应用信息右上角允许受限设置）。")
-        return svc.readAllowedScreen(ctx.settings.accessibilityAllowlist)
+        return svc.readAllowedScreen(ctx.settings.accessibilityAllowlist, extraBlocked = ctx.settings.customBlockedPackages)
     }
 }
 
@@ -52,9 +52,16 @@ class ScreenActTool : Tool {
     override suspend fun run(args: JsonObject, ctx: ToolContext): ToolResult {
         val act = args.s("action") ?: return ToolResult.fail("缺少 action")
         val allowlist = ctx.settings.accessibilityAllowlist
+        val extraBlocked = ctx.settings.customBlockedPackages
         if (act == "open_app") {
-            val pkg = args.s("package_name") ?: return ToolResult.fail("缺少 package_name")
+            val pkg = args.s("package_name")?.trim() ?: return ToolResult.fail("缺少 package_name")
             if (SafetyFuse.isHardBlockedPackage(pkg)) return ToolResult.fail("安全熔断：禁止自动化操作 $pkg，请改用 app_handoff。")
+            if (SafetyFuse.peerAccessibilityPackages(ctx.app).any { it.equals(pkg, ignoreCase = true) }) {
+                return ToolResult.fail("安全熔断：应用 $pkg 正在运行其他无障碍服务，Pib 已自动避让。")
+            }
+            if (extraBlocked.any { it.equals(pkg, ignoreCase = true) }) {
+                return ToolResult.fail("安全熔断：应用 $pkg 已被列入本机熔断保护名单。")
+            }
             if (allowlist.none { it.equals(pkg, ignoreCase = true) }) return ToolResult.fail("应用 $pkg 不在无障碍白名单中。")
             val launch = ctx.app.packageManager.getLaunchIntentForPackage(pkg)?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 ?: return ToolResult.fail("手机未安装 $pkg。")
@@ -64,6 +71,6 @@ class ScreenActTool : Tool {
         }
         val svc = PibAccessibilityService.instance
             ?: return ToolResult.fail("尚未开启 Pib 无障碍辅助服务，请到「更多 → 工具权限」开启。")
-        return svc.actOnAllowedScreen(act, args.s("target"), args.s("text"), allowlist)
+        return svc.actOnAllowedScreen(act, args.s("target"), args.s("text"), allowlist, extraBlocked = extraBlocked)
     }
 }

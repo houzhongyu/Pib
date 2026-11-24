@@ -33,24 +33,40 @@ class ThreadStore(private val dir: File?) {
     val companionId: String = infos.firstOrNull { it.kind == ThreadKind.COMPANION }?.id
         ?: ThreadInfo(COMPANION_ID, ThreadKind.COMPANION, "Pib").also { infos += it; saveIndex() }.id
 
+    @Synchronized
     fun assistantThreads(query: String = ""): List<ThreadInfo> {
         val q = query.trim()
         return infos.filter { it.kind == ThreadKind.ASSISTANT }
             .filter { q.isEmpty() || it.title.contains(q, ignoreCase = true) || chat(it.id).all.any { m -> m.content?.contains(q, true) == true } }
+            .map { it.copy() }
             .sortedWith(compareByDescending<ThreadInfo> { it.pinned }.thenByDescending { it.updatedAt })
     }
 
-    fun info(id: String): ThreadInfo? = infos.firstOrNull { it.id == id }
+    @Synchronized
+    fun info(id: String): ThreadInfo? = infos.firstOrNull { it.id == id }?.copy()
 
+    @Synchronized
     fun chat(id: String): ChatStore = chats.getOrPut(id) { ChatStore(dir?.let { File(it, "$id.json") }) }
 
+    @Synchronized
     fun create(firstMessage: String): ThreadInfo =
-        ThreadInfo(UUID.randomUUID().toString(), ThreadKind.ASSISTANT, titleFrom(firstMessage)).also { infos += it; saveIndex() }
+        ThreadInfo(UUID.randomUUID().toString(), ThreadKind.ASSISTANT, titleFrom(firstMessage))
+            .also { infos += it; saveIndex() }
+            .copy()
 
-    fun touch(id: String) { info(id)?.updatedAt = System.currentTimeMillis(); saveIndex() }
+    @Synchronized
+    fun touch(id: String) {
+        infos.firstOrNull { it.id == id }?.updatedAt = System.currentTimeMillis()
+        saveIndex()
+    }
 
-    fun togglePin(id: String) { info(id)?.let { it.pinned = !it.pinned }; saveIndex() }
+    @Synchronized
+    fun togglePin(id: String) {
+        infos.firstOrNull { it.id == id }?.let { it.pinned = !it.pinned }
+        saveIndex()
+    }
 
+    @Synchronized
     fun delete(id: String) {
         if (id == companionId) { chat(id).clear(); return }
         infos.removeAll { it.id == id }
@@ -59,6 +75,7 @@ class ThreadStore(private val dir: File?) {
         saveIndex()
     }
 
+    @Synchronized
     fun clearAll() {
         infos.filter { it.kind == ThreadKind.ASSISTANT }.map { it.id }.forEach { delete(it) }
         chat(companionId).clear()
@@ -66,10 +83,7 @@ class ThreadStore(private val dir: File?) {
 
     private fun saveIndex() {
         val f = indexFile ?: return
-        f.parentFile?.mkdirs()
-        val tmp = File(f.parentFile, f.name + ".tmp")
-        tmp.writeText(json.encodeToString(infos))
-        tmp.renameTo(f)
+        AtomicFile.writeText(f, json.encodeToString(infos))
     }
 
     companion object {

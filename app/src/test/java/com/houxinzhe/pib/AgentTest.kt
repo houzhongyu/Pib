@@ -1,5 +1,6 @@
 package com.houxinzhe.pib
 
+import android.content.Intent
 import com.google.common.truth.Truth.assertThat
 import com.houxinzhe.pib.agent.Agent
 import com.houxinzhe.pib.agent.AgentHost
@@ -15,13 +16,19 @@ import com.houxinzhe.pib.data.ChatStore
 import com.houxinzhe.pib.llm.ChatMessage
 import com.houxinzhe.pib.llm.ChatModel
 import com.houxinzhe.pib.llm.LlmClient
+import com.houxinzhe.pib.llm.LlmConfig
+import com.houxinzhe.pib.llm.LlmException
 import com.houxinzhe.pib.llm.ToolCall
 import com.houxinzhe.pib.llm.schema
 import com.houxinzhe.pib.llm.str
 import com.houxinzhe.pib.tools.AlarmSetTool
+import com.houxinzhe.pib.tools.AppHandoffTool
 import com.houxinzhe.pib.tools.TimeParse
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -42,8 +49,17 @@ class AgentTest {
 
     private class Host(val approve: Boolean, val grant: Boolean = true) : AgentHost {
         var asked = 0
-        override suspend fun confirm(tool: Tool, preview: String): Boolean { asked++; return approve }
+        var lastConfirmedRisk: Risk? = null
+        val streamedSnapshots = mutableListOf<String>()
+        override suspend fun confirm(tool: Tool, risk: Risk, preview: String): Boolean {
+            asked++
+            lastConfirmedRisk = risk
+            return approve
+        }
         override suspend fun ensurePermissions(permissions: List<String>) = grant
+        override fun streaming(text: String) {
+            if (text.isNotEmpty()) streamedSnapshots += text
+        }
     }
 
     /** Model that calls the given tool once, then answers with the receipt it saw. */
@@ -78,8 +94,69 @@ class AgentTest {
         val r = agent(scripted("pay"), listOf(t), store).respond("sys", emptyList(), "pay", host)
         assertThat(t.runs).isEqualTo(0)
         assertThat(host.asked).isEqualTo(1)
+        assertThat(host.lastConfirmedRisk).isEqualTo(Risk.SENSITIVE)
         assertThat(r.text).contains("用户拒绝")
         assertThat(store.all.single().steps.single().status).isEqualTo(StepStatus.DENIED)
+    }
+
+    @Test fun escalatedCallRiskIsPassedToConfirmDialog() = runTest {
+        // AppHandoffTool default risk is REVERSIBLE, but amap_taxi escalates to SENSITIVE.
+        val handoff = AppHandoffTool()
+        val host = Host(approve = false)
+        val store = TaskStore(null)
+        val model = scripted("app_handoff", """{"target":"amap_taxi","destination":"虹桥火车站"}""")
+        agent(model, listOf(handoff), store, strict = false).respond("sys", emptyList(), "打车", host)
+        assertThat(host.asked).isEqualTo(1)
+        assertThat(host.lastConfirmedRisk).isEqualTo(Risk.SENSITIVE)
+    }
+
+    @Test fun cancellationDuringWriteMarksStepUncertainAndRethrows() = runTest {
+        val cancellingWriteTool = object : Tool {
+            override val name = "write_cancel"
+            override val title = "写操作"
+            override val description = "test"
+            override val risk = Risk.REVERSIBLE
+            override val parameters = schema()
+            override suspend fun run(args: JsonObject, ctx: ToolContext): ToolResult {
+                throw CancellationException("user pressed stop")
+            }
+        }
+        val store = TaskStore(File(tmp.root, "cancel.json"))
+        var caughtCancel = false
+        try {
+            agent(scripted("write_cancel", "{}"), listOf(cancellingWriteTool), store)
+                .respond("sys", emptyList(), "run", Host(approve = true))
+        } catch (_: CancellationException) {
+            caughtCancel = true
+        }
+        assertThat(caughtCancel).isTrue()
+        val recorded = store.all.single()
+        assertThat(recorded.finished).isTrue()
+        assertThat(recorded.steps.single().status).isEqualTo(StepStatus.UNCERTAIN)
+    }
+
+    @Test fun cancellationMidBatchBalancesSiblingToolCallIds() = runTest {
+        val okTool = FakeTool("first_ok", Risk.READ)
+        val cancelTool = object : Tool {
+            override val name = "second_cancel"
+            override val title = "取消步骤"
+            override val description = "test"
+            override val risk = Risk.READ
+            override val parameters = schema()
+            override suspend fun run(args: JsonObject, ctx: ToolContext): ToolResult = throw CancellationException("stop")
+        }
+        val multiCallModel = ChatModel { _, _ ->
+            ChatMessage.assistant(null, listOf(ToolCall("id_1", "first_ok", """{"x":"a"}"""), ToolCall("id_2", "second_cancel", "{}"), ToolCall("id_3", "first_ok", "{}")))
+        }
+        var captured: com.houxinzhe.pib.agent.AgentCancelledException? = null
+        try {
+            agent(multiCallModel, listOf(okTool, cancelTool), TaskStore(null)).respond("sys", emptyList(), "go", Host(true))
+        } catch (ce: com.houxinzhe.pib.agent.AgentCancelledException) {
+            captured = ce
+        }
+        assertThat(captured).isNotNull()
+        val toolResponses = captured!!.completedMessages.filter { it.role == "tool" }
+        assertThat(toolResponses.map { it.toolCallId }).containsExactly("id_1", "id_2", "id_3").inOrder()
     }
 
     @Test fun reversibleNeedsConfirmOnlyInStrictMode() = runTest {
@@ -132,17 +209,67 @@ class AgentTest {
         assertThat(w.first().content).isEqualTo("b")
     }
 
-    @Test fun parsesToolCallsFromOpenAiResponse() {
+    @Test fun parsesToolCallsSseStreamsDeepSeekMaxAndBlocksPublicHttp() {
+        val client = LlmClient { throw IllegalStateException() }
         val body = """{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"alarm_set","arguments":"{\"hour\":7,\"minute\":40}"}}]}}]}"""
-        val m = LlmClient { throw IllegalStateException() }.parse(body)
+        val m = client.parse(body)
         assertThat(m.toolCalls!!.single().name).isEqualTo("alarm_set")
         assertThat(m.toolCalls!!.single().arguments).contains("\"hour\":7")
-        val r = LlmClient { throw IllegalStateException() }.parse(body.replace("\"content\":null", "\"content\":\"\",\"reasoning_content\":\"think\""))
+        val r = client.parse(body.replace("\"content\":null", "\"content\":\"\",\"reasoning_content\":\"think\""))
         assertThat(r.reasoning).isEqualTo("think")
         assertThat(r.toJson()["reasoning_content"].toString()).isEqualTo("\"think\"")
         val stored = ChatStore(null).apply { append(listOf(ChatMessage.user("u"), r)) }.all
         assertThat(stored.last().reasoning).isNull()
+
+        // SSE streaming: incremental text + reasoning + multi-chunk tool_calls
+        val deltas = mutableListOf<String>()
+        var reasoned = false
+        val sseText = """
+            data: {"choices":[{"delta":{"reasoning_content":"先算一下"}}]}
+            data: {"choices":[{"delta":{"content":"早上"}}]}
+            data: {"choices":[{"delta":{"content":"好！"}}]}
+            data: [DONE]
+        """.trimIndent()
+        val streamedMsg = client.parseSseString(sseText, onDelta = { deltas += it }, onReasoning = { reasoned = true })
+        assertThat(reasoned).isTrue()
+        assertThat(deltas).containsExactly("早上", "早上好！").inOrder()
+        assertThat(streamedMsg.content).isEqualTo("早上好！")
+        assertThat(streamedMsg.reasoning).isEqualTo("先算一下")
+
+        val sseTool = """
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"alarm_","arguments":"{\"hour\":"}}]}}]}
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"set","arguments":"8}"}}]}}]}
+            data: [DONE]
+        """.trimIndent()
+        val streamedTool = client.parseSseString(sseTool)
+        assertThat(streamedTool.toolCalls!!.single().id).isEqualTo("call_a")
+        assertThat(streamedTool.toolCalls!!.single().name).isEqualTo("alarm_set")
+        assertThat(streamedTool.toolCalls!!.single().arguments).isEqualTo("{\"hour\":8}")
+
+        // DeepSeek "max" tier maps to reasoning_effort="high" + max_tokens=6000
+        val reqBody = client.buildRequestBody(
+            LlmConfig("https://api.deepseek.com/v1", "sk-x", "deepseek-flash", thinking = "max"),
+            listOf(ChatMessage.user("hi")),
+            emptyList(),
+            streamMode = true,
+        )
+        assertThat(reqBody["reasoning_effort"]!!.jsonPrimitive.content).isEqualTo("high")
+        assertThat(reqBody["max_tokens"]!!.jsonPrimitive.content).isEqualTo("6000")
+
+        // Endpoint transport security: block public cleartext HTTP, allow LAN HTTP & public HTTPS
         assertThat(LlmClient.endpoint("https://api.deepseek.com/v1/")).isEqualTo("https://api.deepseek.com/v1/chat/completions")
+        assertThat(LlmClient.endpoint("http://192.168.1.50:11434/v1")).isEqualTo("http://192.168.1.50:11434/v1/chat/completions")
+        assertThrows(LlmException::class.java) { LlmClient.endpoint("http://api.public-proxy.example.com/v1") }
+        assertThrows(LlmException::class.java) { LlmClient.endpoint("http://8.8.4.4:8000/v1") }
+    }
+
+    @Test fun inboundIntentDeduplicationGuard() {
+        assertThat(MainActivity.shouldConsumeInboundAction(Intent.ACTION_SEND, alreadyConsumed = false, isRestoredState = false)).isTrue()
+        assertThat(MainActivity.shouldConsumeInboundAction(Intent.ACTION_VIEW, alreadyConsumed = false, isRestoredState = false)).isTrue()
+        // Activity recreation (e.g. dark-mode switch) or already-consumed intent must NOT fire again!
+        assertThat(MainActivity.shouldConsumeInboundAction(Intent.ACTION_SEND, alreadyConsumed = false, isRestoredState = true)).isFalse()
+        assertThat(MainActivity.shouldConsumeInboundAction(Intent.ACTION_SEND, alreadyConsumed = true, isRestoredState = false)).isFalse()
+        assertThat(MainActivity.shouldConsumeInboundAction(Intent.ACTION_MAIN, alreadyConsumed = false, isRestoredState = false)).isFalse()
     }
 
     @Test fun repeatAndTimeParsing() {

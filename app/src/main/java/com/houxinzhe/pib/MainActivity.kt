@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -30,6 +31,7 @@ import com.houxinzhe.pib.ui.AboutPage
 import com.houxinzhe.pib.ui.AllowlistPage
 import com.houxinzhe.pib.ui.AssistantScreen
 import com.houxinzhe.pib.ui.BridgePage
+import com.houxinzhe.pib.ui.BridgePairConfirmDialog
 import com.houxinzhe.pib.ui.ButlerPage
 import com.houxinzhe.pib.ui.CompanionScreen
 import com.houxinzhe.pib.ui.ConfirmDialog
@@ -57,7 +59,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        handleShare(intent)
+        if (savedInstanceState == null) {
+            handleInboundIntent(intent)
+        }
         setContent {
             PibTheme {
                 val req = vm.permission
@@ -98,6 +102,9 @@ class MainActivity : ComponentActivity() {
                         Sidebar(vm)
                     }
                     vm.confirm?.let { ConfirmDialog(it, vm::answerConfirm) }
+                    if (vm.privacyAccepted) {
+                        vm.pendingBridgePair?.let { BridgePairConfirmDialog(it, vm::answerBridgePairing) }
+                    }
                     if (!vm.privacyAccepted) PrivacyConsentSheet { vm.acceptPrivacy() }
                 }
             }
@@ -106,24 +113,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleShare(intent)
+        setIntent(intent)
+        handleInboundIntent(intent)
     }
 
-    private fun handleShare(intent: Intent?) {
+    private fun handleInboundIntent(intent: Intent?) {
+        if (!shouldConsumeInboundIntent(intent)) return
+        intent?.putExtra(EXTRA_CONSUMED, true)
         if (intent?.action == Intent.ACTION_VIEW) {
             val dataStr = intent.dataString.orEmpty()
-            if (vm.settings.importBridgePairing(dataStr)) {
-                vm.touch()
-                vm.page = Page.BRIDGE
-                android.widget.Toast.makeText(this, "已导入远程电脑与 DSH 桥配对配置", android.widget.Toast.LENGTH_SHORT).show()
+            if (!vm.requestBridgePairing(dataStr)) {
+                Toast.makeText(this, "配对链接无效，或公网地址未使用 https://", Toast.LENGTH_SHORT).show()
             }
             return
         }
         if (intent?.action == Intent.ACTION_SEND) {
             intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }?.let { shared ->
-                vm.page = null
-                vm.tab = Tab.HOME
-                vm.sendHome("帮我处理这段内容：\n$shared")
+                vm.stageSharedText(shared)
             }
         }
     }
@@ -136,5 +142,25 @@ class MainActivity : ComponentActivity() {
         val others = perms.filter { it !in location }
         val locs = perms.filter { it in location }
         return others.all(ok) && (locs.isEmpty() || locs.any(ok))
+    }
+
+    companion object {
+        const val EXTRA_CONSUMED = "com.houxinzhe.pib.INTENT_CONSUMED"
+
+        internal fun shouldConsumeInboundAction(
+            action: String?,
+            alreadyConsumed: Boolean,
+            isRestoredState: Boolean,
+        ): Boolean {
+            if (isRestoredState || alreadyConsumed || action == null) return false
+            return action == Intent.ACTION_VIEW || action == Intent.ACTION_SEND
+        }
+
+        internal fun shouldConsumeInboundIntent(intent: Intent?, isRestoredState: Boolean = false): Boolean =
+            shouldConsumeInboundAction(
+                action = intent?.action,
+                alreadyConsumed = intent?.getBooleanExtra(EXTRA_CONSUMED, false) == true,
+                isRestoredState = isRestoredState,
+            )
     }
 }

@@ -9,24 +9,36 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.houxinzhe.pib.PibApp
+import com.houxinzhe.pib.agent.AgentCancelledException
 import com.houxinzhe.pib.agent.AgentHost
 import com.houxinzhe.pib.agent.Prompt
 import com.houxinzhe.pib.agent.Risk
 import com.houxinzhe.pib.agent.Tool
 import com.houxinzhe.pib.data.AttachmentLoader
+import com.houxinzhe.pib.data.BridgePairing
 import com.houxinzhe.pib.data.ButlerParser
 import com.houxinzhe.pib.data.ChatStore
 import com.houxinzhe.pib.data.DraftAttachment
+import com.houxinzhe.pib.data.Settings
 import com.houxinzhe.pib.data.ThinkingTiers
 import com.houxinzhe.pib.data.ThreadInfo
 import com.houxinzhe.pib.data.ephemeralChat
 import com.houxinzhe.pib.llm.BalanceClient
 import com.houxinzhe.pib.llm.ChatMessage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 data class ConfirmRequest(val title: String, val risk: Risk, val preview: String, val answer: CompletableDeferred<Boolean>)
 data class PermissionRequest(val permissions: List<String>, val answer: CompletableDeferred<Boolean>)
+
+data class PendingBridgePair(
+    val pairing: BridgePairing,
+    val fingerprint: String,
+    val replacesExisting: Boolean,
+    val previousUrl: String,
+)
 
 data class Receipt(val title: String, val text: String, val ok: Boolean)
 
@@ -77,32 +89,49 @@ class PibViewModel(application: Application) : AndroidViewModel(application) {
     var busyKey by mutableStateOf<String?>(null); private set
     var pending by mutableStateOf<Pair<String, String>?>(null); private set
     var progress by mutableStateOf<String?>(null); private set
+    var streamingText by mutableStateOf<String?>(null); private set
     var confirm by mutableStateOf<ConfirmRequest?>(null); private set
     var permission by mutableStateOf<PermissionRequest?>(null); private set
+    var pendingBridgePair by mutableStateOf<PendingBridgePair?>(null); private set
+    var sharedDraft by mutableStateOf<String?>(null); private set
+    var companionRestoredDraft by mutableStateOf<String?>(null); private set
     var lastError by mutableStateOf<String?>(null); private set
 
-    /** Bumped whenever stored conversations or butler items change so composables re-read them. */
+    /** Bumped whenever stored conversations, settings, or butler items change so composables re-read them. */
     var revision by mutableIntStateOf(0); private set
 
     private var tempChat: ChatStore = ephemeralChat()
+    private var activeJob: Job? = null
 
     val threads get() = app.threads
     val tasks get() = app.tasks.all
 
     private val host = object : AgentHost {
-        override suspend fun confirm(tool: Tool, preview: String): Boolean {
+        override suspend fun confirm(tool: Tool, risk: Risk, preview: String): Boolean {
             val d = CompletableDeferred<Boolean>()
-            confirm = ConfirmRequest(tool.title, tool.risk, preview, d)
-            return d.await().also { confirm = null }
+            confirm = ConfirmRequest(tool.title, risk, preview, d)
+            return try {
+                d.await()
+            } finally {
+                confirm = null
+            }
         }
 
         override suspend fun ensurePermissions(permissions: List<String>): Boolean {
             val d = CompletableDeferred<Boolean>()
             permission = PermissionRequest(permissions, d)
-            return d.await().also { permission = null }
+            return try {
+                d.await()
+            } finally {
+                permission = null
+            }
         }
 
         override fun progress(text: String) { progress = text }
+
+        override fun streaming(text: String) {
+            streamingText = text.ifEmpty { null }
+        }
     }
 
     val homeKey get() = if (temporary) "temp" else assistantThread ?: "new"
@@ -110,6 +139,45 @@ class PibViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun currentHomeChat(): ChatStore? =
         if (temporary) tempChat else assistantThread?.let { threads.chat(it) }
+
+    // ---- Inbound Intents (Deep-link Pairing & Share Draft) ----
+
+    /** Parses and stages a `pib://pair-bridge` URI for explicit user confirmation instead of silently overwriting config. */
+    fun requestBridgePairing(rawUri: String): Boolean {
+        val parsed = Settings.parseBridgePairingUri(rawUri) ?: return false
+        val hasExisting = settings.bridgeUrl.isNotBlank() || settings.bridgeToken.isNotBlank()
+        pendingBridgePair = PendingBridgePair(
+            pairing = parsed,
+            fingerprint = Settings.tokenFingerprint(parsed.token),
+            replacesExisting = hasExisting && (settings.bridgeUrl != parsed.url || settings.bridgeToken != parsed.token),
+            previousUrl = settings.bridgeUrl,
+        )
+        return true
+    }
+
+    fun answerBridgePairing(approved: Boolean) {
+        val req = pendingBridgePair ?: return
+        pendingBridgePair = null
+        if (approved) {
+            settings.applyBridgePairing(req.pairing)
+            sidebar = false
+            page = Page.BRIDGE
+            revision++
+        }
+    }
+
+    /** Stages shared external text into the Home composer without auto-sending to the model. */
+    fun stageSharedText(raw: String) {
+        val clean = raw.trim()
+        if (clean.isEmpty()) return
+        sidebar = false
+        page = null
+        tab = Tab.HOME
+        sharedDraft = "帮我处理这段内容：\n$clean"
+    }
+
+    fun consumeSharedDraft(): String? = sharedDraft.also { sharedDraft = null }
+    fun consumeCompanionRestoredDraft(): String? = companionRestoredDraft.also { companionRestoredDraft = null }
 
     // ---- Attachments ----
 
@@ -228,7 +296,16 @@ class PibViewModel(application: Application) : AndroidViewModel(application) {
         if (!speakReplies) speaker.stop()
     }
 
-    // ---- Shared ----
+    // ---- Shared Execution & Cancellation ----
+
+    fun stopGeneration() {
+        speaker.stop()
+        confirm?.answer?.complete(false)
+        confirm = null
+        permission?.answer?.complete(false)
+        permission = null
+        activeJob?.cancel()
+    }
 
     private fun buildPromptWithAttachment(text: String, att: DraftAttachment?): String = when {
         att == null -> text
@@ -245,8 +322,9 @@ class PibViewModel(application: Application) : AndroidViewModel(application) {
         speakAfter: Boolean,
         after: () -> Unit,
     ) {
-        busyKey = key; pending = key to displayRequest(text, att?.name); lastError = null; progress = null
-        viewModelScope.launch {
+        val shownReq = displayRequest(text, att?.name)
+        busyKey = key; pending = key to shownReq; lastError = null; progress = null; streamingText = null
+        activeJob = viewModelScope.launch {
             try {
                 val reply = app.agent.respond(
                     system = system,
@@ -258,12 +336,23 @@ class PibViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 chat.append(reply.newMessages)
                 if (speakAfter && speakReplies && reply.text.isNotBlank()) speaker.speak(reply.text)
+            } catch (ce: CancellationException) {
+                val prior = (ce as? AgentCancelledException)?.completedMessages.orEmpty()
+                val partial = streamingText?.trim().orEmpty()
+                if (prior.size > 1 || partial.isNotEmpty()) {
+                    val base = if (prior.isNotEmpty()) prior else listOf(ChatMessage.user(text, attachmentName = att?.name))
+                    val tailNote = if (partial.isNotEmpty()) "$partial\n\n（已停止）" else "（已按你的要求停止后续步骤）"
+                    chat.append(base + ChatMessage.assistant(tailNote))
+                } else if (shownReq.isNotBlank()) {
+                    if (key == companionKey) companionRestoredDraft = shownReq else sharedDraft = shownReq
+                }
             } catch (e: Exception) {
                 chat.append(listOf(ChatMessage.user(text, attachmentName = att?.name), ChatMessage.assistant("失败：${e.message ?: "请求没有完成"}")))
                 lastError = e.message ?: e.javaClass.simpleName
             } finally {
                 after()
-                busyKey = null; pending = null; progress = null; revision++
+                activeJob = null
+                busyKey = null; pending = null; progress = null; streamingText = null; revision++
             }
         }
     }

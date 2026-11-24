@@ -108,10 +108,7 @@ class ButlerStore(private val file: File?) {
 
     private fun save() {
         val f = file ?: return
-        f.parentFile?.mkdirs()
-        val tmp = File(f.parentFile, f.name + ".tmp")
-        tmp.writeText(json.encodeToString(ButlerSnapshot(parcels.toList(), trips.toList())))
-        tmp.renameTo(f)
+        AtomicFile.writeText(f, json.encodeToString(ButlerSnapshot(parcels.toList(), trips.toList())))
     }
 }
 

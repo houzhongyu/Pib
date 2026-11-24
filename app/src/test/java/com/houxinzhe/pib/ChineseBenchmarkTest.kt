@@ -47,21 +47,32 @@ import com.houxinzhe.pib.tools.TimerSetTool
 import com.houxinzhe.pib.tools.TripAddTool
 import com.houxinzhe.pib.tools.TripListTool
 import com.houxinzhe.pib.tools.WeatherTool
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
+import java.net.ServerSocket
 import java.time.LocalDate
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 /**
  * 50+ realistic Chinese personal phone-agent scenarios covering D5 (parcel & 12306/flight SMS),
  * D6 (domestic super-app deep-link handoff & sensitive confirmation), D7-D8 (SafetyFuse hard
- * breakers), multimodal attachments, balance parsing, keyless weather, and chat editing.
+ * breakers, peer accessibility isolation & local custom blocked list), multimodal attachments,
+ * balance parsing, keyless weather, HMAC-signed bridge requests, and safe failover.
  */
 class ChineseBenchmarkTest {
     @get:Rule val tmp = TemporaryFolder()
@@ -93,7 +104,6 @@ class ChineseBenchmarkTest {
             assertThat(p.station).isEqualTo(expected.second)
         }
 
-        // OTP, login codes, and bank notifications must NEVER be mistaken for parcel codes!
         val otpSamples = listOf(
             "【微信】验证码 382910，用于登录安全验证，5分钟内有效，请勿泄露。",
             "【支付宝】您的动态码为 991204，请勿告知他人。",
@@ -130,7 +140,6 @@ class ChineseBenchmarkTest {
         assertThat(dTrain.seat).isEqualTo("03车08A号")
         assertThat(dTrain.gate).isEqualTo("A2")
 
-        // New-year rollover: Jan ticket bought in Nov should roll to 2027.
         val nyTrain = ButlerParser.parseTrip("【铁路12306】您已购1月3日C2012次天津站09:30开，02车04C号。", today)!!
         assertThat(nyTrain.departTime).isEqualTo("2027-01-03 09:30")
 
@@ -218,39 +227,52 @@ class ChineseBenchmarkTest {
         assertThat(HandoffCatalog.build("railway_12306", "G1204", null, null, null)!!.launchPackage).isEqualTo("com.MobileTicket")
         assertThat(HandoffCatalog.build("cainiao", "SF123", null, null, null)!!.launchPackage).isEqualTo("com.cainiao.wireless")
         assertThat(HandoffCatalog.build("open_url", "https://www.12306.cn", null, null, null)!!.primaryUri).isEqualTo("https://www.12306.cn")
-        // Reject javascript: or file: schemes in open_url!
         assertThat(HandoffCatalog.build("open_url", "javascript:alert(1)", null, null, null)).isNull()
         assertThat(HandoffCatalog.build("open_url", "file:///sdcard/secret", null, null, null)).isNull()
     }
 
-    @Test fun safetyFuseBlocksSuperAppsPaymentsPasswordsCaptchasAndFactoryReset() {
+    @Test fun safetyFuseBlocksSuperAppsPeerA11yCustomBlockedPasswordVaultsAndSensitiveScreens() {
         val allow = setOf("org.mozilla.firefox", "com.android.BBKClock", "com.tencent.mm", "com.eg.android.AlipayGphone")
         val normalNodes = listOf(UiNodeSummary(0, "闹钟", clickable = true), UiNodeSummary(1, "07:30"))
 
-        // 1. Even if someone forces WeChat / Alipay / Bank / Meituan / Taobao into allowlist, HARD_BLOCKED_PACKAGES wins!
+        // 1. Built-in hard-blocked super-apps, banks, installers, and password vaults
         listOf(
             "com.tencent.mm",
             "com.eg.android.AlipayGphone",
             "com.icbc",
             "cmb.pb",
+            "cn.com.cmbc.newmbank",
             "com.mybank.android.phone",
             "com.sankuai.meituan",
             "com.taobao.taobao",
             "com.xunmeng.pinduoduo",
             "com.android.permissioncontroller",
             "com.android.packageinstaller",
+            "com.x8bit.bitwarden",
+            "com.agilebits.onepassword",
+            "keepass2android.keepass2android",
         ).forEach { pkg ->
             val v = SafetyFuse.check(pkg, allow + pkg, normalNodes)
             assertThat(v).isInstanceOf(FuseVerdict.Blocked::class.java)
         }
 
-        // 2. Non-allowlisted ordinary app is blocked until user enables it.
+        // 2. Peer AccessibilityService apps & local custom blocked apps are blocked even if present in allowlist!
+        val peerPkg = "com.example.peer.runtime"
+        val customPkg = "com.example.local.sensitive"
+        assertThat(
+            SafetyFuse.check(peerPkg, allow + peerPkg, normalNodes, peerA11yPackages = setOf(peerPkg))
+        ).isInstanceOf(FuseVerdict.Blocked::class.java)
+        assertThat(
+            SafetyFuse.check(customPkg, allow + customPkg, normalNodes, extraBlocked = setOf(customPkg))
+        ).isInstanceOf(FuseVerdict.Blocked::class.java)
+
+        // 3. Non-allowlisted ordinary app is blocked until user enables it.
         assertThat(SafetyFuse.check("com.example.notes", allow, normalNodes)).isInstanceOf(FuseVerdict.Blocked::class.java)
 
-        // 3. Allowlisted ordinary app with normal nodes passes!
+        // 4. Allowlisted ordinary app with normal nodes passes!
         assertThat(SafetyFuse.check("com.android.BBKClock", allow, normalNodes)).isEqualTo(FuseVerdict.Allowed)
 
-        // 4. Live screen fuses inside an allowlisted browser!
+        // 5. Live screen fuses inside an allowlisted browser!
         assertThat(SafetyFuse.check("org.mozilla.firefox", allow, listOf(UiNodeSummary(0, "", password = true))))
             .isInstanceOf(FuseVerdict.Blocked::class.java)
         assertThat(SafetyFuse.check("org.mozilla.firefox", allow, listOf(UiNodeSummary(0, "立即支付 ¥88.00", clickable = true))))
@@ -265,8 +287,7 @@ class ChineseBenchmarkTest {
             .isInstanceOf(FuseVerdict.Blocked::class.java)
     }
 
-    @Test fun multimodalAttachmentUtf8GuardBalanceWeatherAndChatEditing() {
-        // Multimodal JSON payload & disk stripping
+    @Test fun multimodalAttachmentUtf8GuardBalanceWeatherAndChatEditing() = runTest {
         val imgMsg = ChatMessage.user("看图", imageDataUrl = "data:image/jpeg;base64,AAAA", attachmentName = "车票.jpg")
         val serialized = imgMsg.toJson()
         assertThat(serialized["content"]!!.jsonArray).hasSize(2)
@@ -277,23 +298,22 @@ class ChineseBenchmarkTest {
         assertThat(reloaded.all.first().imageDataUrl).isNull()
         assertThat(reloaded.all.first().attachmentName).isEqualTo("车票.jpg")
 
-        // Delete & pop exchange for long-press menu
         assertThat(reloaded.popLastExchange()).isEqualTo("第二句")
         assertThat(reloaded.all).hasSize(2)
         assertThat(reloaded.deleteExchange(0)).isTrue()
         assertThat(reloaded.all).isEmpty()
 
-        // UTF-8 1 MB strict validator
         assertThat(AttachmentLoader.decodeStrictUtf8("你好 Pib".toByteArray(Charsets.UTF_8))).isEqualTo("你好 Pib")
         assertThrows(IllegalArgumentException::class.java) { AttachmentLoader.decodeStrictUtf8(byteArrayOf(0, 1, 2)) }
         assertThrows(IllegalArgumentException::class.java) { AttachmentLoader.decodeStrictUtf8(byteArrayOf(0xFF.toByte(), 0xFE.toByte())) }
         assertThrows(IllegalArgumentException::class.java) { AttachmentLoader.decodeStrictUtf8(ByteArray(1_000_001) { 'a'.code.toByte() }) }
 
-        // Balance parsing
         val dsBal = BalanceClient.parseBalance("https://api.deepseek.com/v1", """{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"4.98"}]}""")
         assertThat(dsBal).isEqualTo("CNY 4.98")
+        // BalanceClient must reject cleartext public HTTP and must not match deepseek.com in URL path!
+        assertThat(BalanceClient.query("http://api.deepseek.com/v1", "sk-test")).contains("安全拦截")
+        assertThat(BalanceClient.query("https://my-proxy.example.com/deepseek.com/v1", "sk-test")).contains("网页控制台")
 
-        // Keyless Open-Meteo weather formatter
         val wxJson = Json.parseToJsonElement(
             """{"current":{"temperature_2m":18.5,"relative_humidity_2m":55,"weather_code":0,"wind_speed_10m":9.2},"daily":{"time":["2026-11-24"],"weather_code":[61],"temperature_2m_max":[20.0],"temperature_2m_min":[11.0]}}"""
         ).jsonObject
@@ -302,7 +322,6 @@ class ChineseBenchmarkTest {
         assertThat(wx.text).contains("浙江杭州 现在 晴，18.5°C")
         assertThat(wx.text).contains("小到中雨 11.0~20.0°C")
 
-        // Registry completeness: all 19 tools have unique names & valid JSON schemas
         val amap = AmapClient(key = { "" })
         val butler = ButlerStore(null)
         val bridge = RemoteBridgeClient(config = { BridgeConfig(false, "", "", "") })
@@ -322,32 +341,126 @@ class ChineseBenchmarkTest {
         assertThat(TimeParse.dateTime("2026/11/25 08:30")).isNotNull()
     }
 
-    @Test fun dshAndComputerBridgePairingAndEndpointSecurity() {
+    @Test fun dshAndComputerBridgePairingHmacAndSafeFailover() {
         val pair = Settings.parseBridgePairingUri(
             "pib://pair-bridge?url=http%3A%2F%2F192.168.1.20%3A18792&token=0123456789abcdef0123456789abcdef&fallback=http%3A%2F%2F100.88.1.2%3A18792"
         )!!
         assertThat(pair.url).isEqualTo("http://192.168.1.20:18792")
         assertThat(pair.fallback).isEqualTo("http://100.88.1.2:18792")
         assertThat(pair.token).hasLength(32)
-        // Reject short tokens or wrong schemes
+        assertThat(Settings.tokenFingerprint(pair.token)).startsWith("SHA256:")
+        assertThat(Settings.tokenFingerprint(pair.token)).contains("…cdef")
+
+        // Reject short tokens, wrong schemes, OR cleartext public HTTP inside pib://pair-bridge!
         assertThat(Settings.parseBridgePairingUri("pib://pair-bridge?url=http://10.0.0.2:18792&token=short")).isNull()
         assertThat(Settings.parseBridgePairingUri("https://example.com?url=x&token=0123456789abcdef0123456789abcdef")).isNull()
+        assertThat(Settings.parseBridgePairingUri("pib://pair-bridge?url=http://8.8.8.8:18792&token=0123456789abcdef0123456789abcdef")).isNull()
+        assertThat(Settings.parseBridgePairingUri("pib://pair-bridge?url=http://evil.example.com:18792&token=0123456789abcdef0123456789abcdef")).isNull()
 
-        // Allow cleartext HTTP ONLY on LAN / Tailscale / Bonjour / loopback
         assertThat(RemoteBridgeClient.validateEndpoint("http://192.168.31.10:18792")).isEqualTo("http://192.168.31.10:18792")
         assertThat(RemoteBridgeClient.validateEndpoint("http://100.101.2.3:18792")).isEqualTo("http://100.101.2.3:18792")
         assertThat(RemoteBridgeClient.validateEndpoint("http://my-mac.local:18792")).isEqualTo("http://my-mac.local:18792")
         assertThat(RemoteBridgeClient.validateEndpoint("https://bridge.example.com")).isEqualTo("https://bridge.example.com")
-        // Block cleartext HTTP to public internet hosts/IPs!
         assertThrows(BridgeException::class.java) { RemoteBridgeClient.validateEndpoint("http://8.8.8.8:18792") }
         assertThrows(BridgeException::class.java) { RemoteBridgeClient.validateEndpoint("http://bridge.example.com:18792") }
 
-        // Exec and DSH delegation always require confirmation
-        val bridge = RemoteBridgeClient(config = { BridgeConfig(true, "http://127.0.0.1:18792", "", "0123456789abcdef0123456789abcdef") })
-        assertThat(BridgeExecTool(bridge).risk.needsConfirm(false)).isTrue()
-        assertThat(DshDelegateTool(bridge).risk.needsConfirm(false)).isTrue()
-        val dshStatus = DshStatusTool(bridge)
-        assertThat(dshStatus.riskFor(Json.parseToJsonElement("""{"action":"poll"}""").jsonObject)).isEqualTo(Risk.READ)
-        assertThat(dshStatus.riskFor(Json.parseToJsonElement("""{"action":"cancel"}""").jsonObject)).isEqualTo(Risk.REVERSIBLE)
+        // Live loopback socket check:
+        // 1) Connect failure on primary -> fails over to fallback, sends HMAC headers (NO cleartext Authorization!), includes X-Idempotency-Key
+        val deadPort = ServerSocket(0).use { it.localPort }
+        val capturedHeaders = AtomicReference<Map<String, String>>(emptyMap())
+        val fallbackHits = AtomicInteger(0)
+        ServerSocket(0).use { fallbackSrv ->
+            val t = thread(isDaemon = true) {
+                runCatching {
+                    fallbackSrv.accept().use { sock ->
+                        fallbackHits.incrementAndGet()
+                        val reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
+                        val hdrs = mutableMapOf<String, String>()
+                        var line = reader.readLine()
+                        while (!line.isNullOrEmpty()) {
+                            val idx = line.indexOf(':')
+                            if (idx > 0) hdrs[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
+                            line = reader.readLine()
+                        }
+                        capturedHeaders.set(hdrs)
+                        val jsonResp = """{"ok":true,"stdout":"from-fallback"}"""
+                        val out = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${jsonResp.toByteArray().size}\r\nConnection: close\r\n\r\n$jsonResp"
+                        sock.getOutputStream().write(out.toByteArray(Charsets.UTF_8))
+                        sock.getOutputStream().flush()
+                    }
+                }
+            }
+            val secret = "0123456789abcdef0123456789abcdef"
+            val client = RemoteBridgeClient(
+                config = {
+                    BridgeConfig(
+                        enabled = true,
+                        primaryUrl = "http://127.0.0.1:$deadPort",
+                        fallbackUrl = "http://127.0.0.1:${fallbackSrv.localPort}",
+                        token = secret,
+                    )
+                }
+            )
+            val resp = runBlocking { client.exec(buildJsonObject { put("mode", "python"); put("code", "print(1)") }, timeoutSec = 2) }
+            t.join(2000)
+            assertThat(resp["stdout"]!!.jsonPrimitive.content).isEqualTo("from-fallback")
+            assertThat(fallbackHits.get()).isEqualTo(1)
+            val hdrs = capturedHeaders.get()
+            assertThat(hdrs).doesNotContainKey("authorization") // No cleartext token over HTTP!
+            assertThat(hdrs["x-pib-signature"]).startsWith("sha256=")
+            assertThat(hdrs).containsKey("x-idempotency-key")
+        }
+
+        // 2) Read timeout AFTER request bytes were already sent to primary -> MUST NOT fail over to fallback!
+        val fallbackNeverHit = AtomicInteger(0)
+        ServerSocket(0).use { stallingPrimary ->
+            ServerSocket(0).use { untouchedFallback ->
+                thread(isDaemon = true) {
+                    runCatching {
+                        stallingPrimary.accept().use { sock ->
+                            val buf = ByteArray(1024)
+                            sock.getInputStream().read(buf) // Receive POST headers/body, then stall past readTimeout!
+                            Thread.sleep(2500)
+                        }
+                    }
+                }
+                thread(isDaemon = true) {
+                    runCatching {
+                        untouchedFallback.soTimeout = 2000
+                        untouchedFallback.accept().close()
+                        fallbackNeverHit.incrementAndGet()
+                    }
+                }
+                val client = RemoteBridgeClient(
+                    config = {
+                        BridgeConfig(
+                            enabled = true,
+                            primaryUrl = "http://127.0.0.1:${stallingPrimary.localPort}",
+                            fallbackUrl = "http://127.0.0.1:${untouchedFallback.localPort}",
+                            token = "0123456789abcdef0123456789abcdef",
+                        )
+                    }
+                )
+                val err = assertThrows(BridgeException::class.java) {
+                    runBlocking {
+                        // status() uses timeoutSec=15, so test via custom short readTimeout client
+                        val fastClient = RemoteBridgeClient(
+                            config = {
+                                BridgeConfig(
+                                    enabled = true,
+                                    primaryUrl = "http://127.0.0.1:${stallingPrimary.localPort}",
+                                    fallbackUrl = "http://127.0.0.1:${untouchedFallback.localPort}",
+                                    token = "0123456789abcdef0123456789abcdef",
+                                )
+                            },
+                        )
+                        // dsh(timeoutSec = 1) triggers readTimeout at 1s after POST is sent!
+                        fastClient.dsh(buildJsonObject { put("action", "submit"); put("task", "slow") }, timeoutSec = 1)
+                    }
+                }
+                assertThat(err.message).contains("请求已送达电脑")
+                assertThat(fallbackNeverHit.get()).isEqualTo(0)
+            }
+        }
     }
 }

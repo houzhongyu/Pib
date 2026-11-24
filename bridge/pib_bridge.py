@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
 """
-Pib × Computer & DSH/Codex Authenticated Bridge (Default Port 18792).
+Pib Cross-Platform Computer & DSH / Codex Bridge (macOS / Linux / Windows).
 
-Zero third-party dependencies (Python 3.10+ stdlib; macOS / Linux / Windows).
-Wire-compatible with `/health`, `/status`, `/exec` AND adds `/dsh` for asynchronous
-delegation to local DSH / Codex / Claude CLI agents in isolated or allowlisted workspaces.
+Zero third-party dependencies (Python 3.10+ standard library only).
+Provides authenticated endpoints for the Pib Android app:
+- One-tap pairing via `pib://pair-bridge?url=...&token=...`
+- Read-only computer & workspace status (`/health`, `POST /status`)
+- Per-call user-confirmed Python / Node / optional shell execution (`POST /exec`)
+- Asynchronous delegation to local DSH / Codex / Claude CLI agents (`POST /dsh`)
 
 Security boundaries:
-- 256-bit Bearer token in ~/.pib_bridge/token (mode 0600, constant-time hmac.compare_digest).
+- 256-bit secret token in ~/.pib_bridge/token (mode 0600).
+- Supports HMAC-SHA256 request signing (`X-Pib-Timestamp`, `X-Pib-Nonce`, `X-Pib-Signature`)
+  with ±300s clock-skew check and nonce replay cache so raw tokens never cross LAN HTTP in
+  cleartext, while keeping constant-time Bearer token support for local CLI/HTTPS use.
+- Default network bind is loopback (`127.0.0.1`) plus detected Tailscale CGNAT IP (`100.64/10`);
+  pass `--lan` to listen on private Wi-Fi LAN interfaces. Public source IPs are rejected (403)
+  unless `--allow-public-ip` is explicitly set behind an HTTPS reverse proxy.
 - Strict realpath workspace allowlist (~/Developer, ~/Desktop, ~/Documents, ~/.pib_bridge,
-  plus optional PIB_BRIDGE_ALLOW_DIRS separated by os.pathsep).
+  plus optional PIB_BRIDGE_ALLOW_DIRS separated by os.pathsep). Note: allowlist scopes working
+  directories and `/status` reads; authorized `/exec` code runs with your user account privileges.
 - `/status` uses fixed argv arrays (shell=False) — zero command injection surface.
-- `/exec` and `/dsh` require explicit user confirmation on the Pib phone before dispatch,
-  enforce workspace allowlist, block privilege-escalation / destructive patterns, and record
-  durable audit & task receipts.
+- `/exec` disables arbitrary shell (`mode="command"`) by default unless `--allow-shell` is passed,
+  enforces regex-based high-risk command guards, deduplicates `X-Idempotency-Key` within 10 minutes,
+  and writes a local audit log (`~/.pib_bridge/audit.jsonl`).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import http.server
+import ipaddress
 import json
 import os
 import platform
@@ -38,22 +50,24 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEFAULT_PORT = int(os.environ.get("PIB_BRIDGE_PORT", "18792"))
-DEFAULT_BIND = os.environ.get("PIB_BRIDGE_BIND", "0.0.0.0")
+DEFAULT_BIND = os.environ.get("PIB_BRIDGE_BIND", "").strip()
+DEFAULT_LAN = os.environ.get("PIB_BRIDGE_LAN", "").strip().lower() in ("1", "true", "yes")
+DEFAULT_ALLOW_SHELL = os.environ.get("PIB_BRIDGE_ALLOW_SHELL", "").strip().lower() in ("1", "true", "yes")
+DEFAULT_ALLOW_PUBLIC_IP = os.environ.get("PIB_BRIDGE_ALLOW_PUBLIC_IP", "").strip().lower() in ("1", "true", "yes")
 STATE_DIR = Path(os.environ.get("PIB_BRIDGE_HOME", str(Path.home() / ".pib_bridge"))).expanduser()
 
-BLOCKED_PATTERNS = (
-    "sudo ",
-    "rm -rf /",
-    "mkfs",
-    "shutdown",
-    "reboot",
-    "launchctl bootout",
-    "diskutil erase",
-    "csrutil",
-    "format c:",
-    "del /f /s /q c:\\",
+BLOCKED_REGEXES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("sudo", re.compile(r"(?i)(?:^|[\s;|&(`'/\\])sudo(?:\s|$)")),
+    ("rm -rf /", re.compile(r"(?i)\brm\s+(?:-[A-Za-z]*[rf][A-Za-z]*\s+|--no-preserve-root\s+){1,4}/(?:\s|$|\*)")),
+    ("mkfs", re.compile(r"(?i)\bmkfs(?:\.[A-Za-z0-9_]+)?\b")),
+    ("shutdown/reboot", re.compile(r"(?i)\b(?:shutdown|reboot|poweroff|halt)\b")),
+    ("launchctl bootout", re.compile(r"(?i)\blaunchctl\s+bootout\b")),
+    ("diskutil erase", re.compile(r"(?i)\bdiskutil\s+erase\w*\b")),
+    ("csrutil", re.compile(r"(?i)\bcsrutil\b")),
+    ("format drive", re.compile(r"(?i)\bformat\s+[a-z]:")),
+    ("del system drive", re.compile(r"(?i)\bdel\s+(?:/[a-z]\s+){1,4}[a-z]:\\")),
 )
 
 EXTENDED_PATH = os.pathsep.join(
@@ -65,13 +79,15 @@ EXTENDED_PATH = os.pathsep.join(
     ]
 )
 
+TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
+
 
 def default_allowed_roots(state_dir: Path = STATE_DIR) -> list[str]:
     roots = [
-        str(state_dir.resolve()),
         str((Path.home() / "Developer").resolve()),
         str((Path.home() / "Desktop").resolve()),
         str((Path.home() / "Documents").resolve()),
+        str(state_dir.resolve()),
     ]
     extra = os.environ.get("PIB_BRIDGE_ALLOW_DIRS", "").strip()
     if extra:
@@ -98,7 +114,7 @@ def load_or_create_token(state_dir: Path = STATE_DIR) -> str:
 def _chmod_600(path: Path) -> None:
     if os.name != "nt":
         try:
-            os.chmod(path, 0o600)
+            path.chmod(0o600)
         except OSError:
             pass
 
@@ -106,10 +122,10 @@ def _chmod_600(path: Path) -> None:
 def append_audit(entry: dict[str, Any], state_dir: Path = STATE_DIR) -> None:
     try:
         state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **entry}
         audit_file = state_dir / "audit.jsonl"
-        entry = {**entry, "ts": round(time.time(), 3)}
         with audit_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
         _chmod_600(audit_file)
     except OSError:
         pass
@@ -119,21 +135,49 @@ def resolve_allowed_dir(raw_path: str | None, allowed_roots: list[str], state_di
     ws_dir = state_dir / "workspace"
     ws_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     dev_dir = Path.home() / "Developer"
-    default_root = dev_dir if dev_dir.is_dir() else ws_dir
+    existing_roots = [Path(r) for r in allowed_roots if os.path.isdir(r)]
+    if dev_dir.is_dir() and any(_is_within(dev_dir, r) for r in existing_roots):
+        default_root = dev_dir
+    elif any(_is_within(ws_dir, r) for r in existing_roots):
+        default_root = ws_dir
+    elif existing_roots:
+        default_root = existing_roots[0]
+    else:
+        default_root = ws_dir
     candidate = Path(raw_path).expanduser() if raw_path else default_root
     if not candidate.is_absolute():
         candidate = default_root / candidate
     try:
-        real = candidate.resolve()
+        real = candidate.resolve(strict=False)
     except OSError:
         return None
-    real_str = str(real)
-    for root in allowed_roots:
-        if os.path.exists(root):
-            root_real = os.path.realpath(root)
-            if real_str == root_real or real_str.startswith(root_real + os.sep):
-                return real
+    for root in existing_roots:
+        if _is_within(real, root):
+            return real
     return None
+
+
+def _is_within(target: Path, root: Path) -> bool:
+    target_real = os.path.realpath(target)
+    root_real = os.path.realpath(root)
+    return target_real == root_real or target_real.startswith(root_real + os.sep)
+
+
+def is_private_or_tailscale_ip(raw_ip: str) -> bool:
+    cleaned = raw_ip.strip()
+    if cleaned.startswith("::ffff:"):
+        cleaned = cleaned[7:]
+    if "%" in cleaned:
+        cleaned = cleaned.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return False
+    if addr.is_loopback or addr.is_private or addr.is_link_local:
+        return True
+    if isinstance(addr, ipaddress.IPv4Address) and addr in TAILSCALE_NET:
+        return True
+    return False
 
 
 def detect_agents() -> dict[str, str]:
@@ -141,133 +185,159 @@ def detect_agents() -> dict[str, str]:
     custom_dsh = os.environ.get("PIB_DSH_CMD", "").strip()
     if custom_dsh:
         found["dsh"] = custom_dsh
-    for name in ("dsh", "codex", "claude"):
-        if name not in found:
-            path = shutil.which(name, path=EXTENDED_PATH)
-            if path:
-                found[name] = path
+    else:
+        dsh_bin = shutil.which("dsh", path=EXTENDED_PATH)
+        if dsh_bin:
+            found["dsh"] = dsh_bin
+    for name in ("codex", "claude"):
+        b = shutil.which(name, path=EXTENDED_PATH)
+        if b:
+            found[name] = b
     return found
 
 
 def estimate_memory_gb() -> tuple[float, float]:
-    sys_name = platform.system()
+    sysname = platform.system()
     try:
-        if sys_name == "Darwin":
-            total_b = int(subprocess.check_output(["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True, timeout=3).strip())
-            vm_out = subprocess.check_output(["/usr/bin/vm_stat"], text=True, timeout=3)
-            page_size = 16384
-            free_pages = 0
-            for line in vm_out.splitlines():
-                if "page size of" in line:
-                    nums = [int(s) for s in line.split() if s.isdigit()]
-                    if nums:
-                        page_size = nums[0]
-                elif any(k in line for k in ("Pages free:", "Pages inactive:", "Pages speculative:")):
-                    num = "".join(ch for ch in line.split(":")[-1] if ch.isdigit())
-                    if num:
-                        free_pages += int(num)
-            return round((free_pages * page_size) / (1024**3), 2), round(total_b / (1024**3), 2)
-        if sys_name == "Linux" and os.path.exists("/proc/meminfo"):
+        if sysname == "Darwin":
+            total = int(subprocess.check_output(["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True, timeout=3).strip())
+            mp = subprocess.check_output(["/usr/bin/memory_pressure", "-Q"], text=True, timeout=4)
+            m = re.search(r"free percentage:\s*(\d+)%", mp)
+            pct = int(m.group(1)) if m else 50
+            total_gb = round(total / (1024**3), 2)
+            return round(total_gb * pct / 100.0, 2), total_gb
+        if sysname == "Linux" and os.path.exists("/proc/meminfo"):
             info: dict[str, int] = {}
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                parts = line.split(":")
-                if len(parts) == 2:
-                    digits = "".join(c for c in parts[1] if c.isdigit())
-                    if digits:
-                        info[parts[0].strip()] = int(digits)
-            total_kb = info.get("MemTotal", 0)
-            avail_kb = info.get("MemAvailable", info.get("MemFree", 0))
-            return round(avail_kb / (1024**2), 2), round(total_kb / (1024**2), 2)
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        info[parts[0].strip()] = int(parts[1].strip().split()[0]) * 1024
+            tot = info.get("MemTotal", 0)
+            avail = info.get("MemAvailable", info.get("MemFree", 0))
+            return round(avail / (1024**3), 2), round(tot / (1024**3), 2)
+        if sysname == "Windows":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))  # type: ignore[attr-defined]
+            return round(stat.ullAvailPhys / (1024**3), 2), round(stat.ullTotalPhys / (1024**3), 2)
     except Exception:
         pass
     return 0.0, 0.0
 
 
-def build_overview(target_dir: Path) -> dict[str, Any]:
-    usage = shutil.disk_usage(str(target_dir if target_dir.exists() else Path.home()))
-    free_disk_gb = round(usage.free / (1024**3), 1)
-    avail_ram_gb, total_ram_gb = estimate_memory_gb()
-    agents = detect_agents()
-
-    git_summary = ""
+def build_overview(target_dir: Path, allow_shell: bool = False) -> dict[str, Any]:
+    avail_gb, total_gb = estimate_memory_gb()
+    try:
+        disk = shutil.disk_usage(str(target_dir if target_dir.exists() else Path.home()))
+        free_disk_gb = round(disk.free / (1024**3), 2)
+    except OSError:
+        free_disk_gb = 0.0
+    git_summary = None
     git_bin = shutil.which("git", path=EXTENDED_PATH)
-    if git_bin and ((target_dir / ".git").exists() or (target_dir.parent / ".git").exists()):
+    if git_bin and (target_dir / ".git").exists():
         try:
-            st = subprocess.check_output([git_bin, "-C", str(target_dir), "status", "--short", "-b"], text=True, timeout=4, stderr=subprocess.DEVNULL).splitlines()
-            lg = subprocess.check_output([git_bin, "-C", str(target_dir), "log", "-n", "3", "--oneline"], text=True, timeout=4, stderr=subprocess.DEVNULL).splitlines()
-            git_summary = "branch: " + (st[0] if st else "") + f" (dirty={max(0, len(st) - 1)}) | recent: " + " ; ".join(lg)
+            branch = subprocess.check_output([git_bin, "-C", str(target_dir), "rev-parse", "--abbrev-ref", "HEAD"], text=True, timeout=4).strip()
+            dirty = len(subprocess.check_output([git_bin, "-C", str(target_dir), "status", "--porcelain"], text=True, timeout=4).splitlines())
+            git_summary = f"{branch} ({dirty} dirty)"
         except Exception:
-            git_summary = ""
-
+            git_summary = None
     return {
         "ok": True,
-        "bridge_version": VERSION,
+        "bridge": "pib-bridge",
+        "version": VERSION,
         "hostname": socket.gethostname(),
-        "platform": f"{platform.system()} {platform.release()}",
-        "cwd": str(target_dir),
+        "platform": f"{platform.system()} {platform.machine()}",
+        "available_ram_gb": avail_gb,
+        "total_ram_gb": total_gb,
         "free_disk_gb": free_disk_gb,
-        "available_ram_gb": avail_ram_gb,
-        "total_ram_gb": total_ram_gb,
-        "agents": list(agents.keys()),
+        "cwd": str(target_dir),
         "git": git_summary,
+        "agents": list(detect_agents().keys()),
+        "shell_enabled": allow_shell,
     }
 
 
-def handle_readonly_status(payload: dict[str, Any], allowed_roots: list[str], state_dir: Path = STATE_DIR) -> dict[str, Any]:
+def handle_readonly_status(payload: dict[str, Any], allowed_roots: list[str], state_dir: Path = STATE_DIR, allow_shell: bool = False) -> dict[str, Any]:
     kind = str(payload.get("kind") or "overview").strip().lower()
     raw_dir = payload.get("cwd")
     target = resolve_allowed_dir(raw_path=raw_dir if isinstance(raw_dir, str) else None, allowed_roots=allowed_roots, state_dir=state_dir)
     if target is None or not target.exists():
-        return {"ok": False, "error": "路径不在允许的工作区范围内或不存在"}
+        return {"ok": False, "error": "目录不在允许的白名单内或不存在"}
+
+    if kind == "overview":
+        return build_overview(target, allow_shell=allow_shell)
 
     if kind == "git":
         git_bin = shutil.which("git", path=EXTENDED_PATH)
         if not git_bin:
             return {"ok": False, "error": "电脑未安装 git"}
         try:
-            st = subprocess.check_output([git_bin, "-C", str(target), "status", "--short", "-b"], text=True, timeout=5, stderr=subprocess.STDOUT)
-            lg = subprocess.check_output([git_bin, "-C", str(target), "log", "-n", "6", "--oneline"], text=True, timeout=5, stderr=subprocess.STDOUT)
-            return {"ok": True, "cwd": str(target), "status": st[:2500], "recent_commits": lg[:1500]}
-        except Exception as exc:
-            return {"ok": False, "error": f"Git 状态读取失败: {exc}"}
+            st = subprocess.check_output([git_bin, "-C", str(target), "status", "-sb"], text=True, stderr=subprocess.STDOUT, timeout=6)
+            lg = subprocess.check_output([git_bin, "-C", str(target), "log", "-n", "5", "--oneline"], text=True, stderr=subprocess.STDOUT, timeout=6)
+            return {"ok": True, "cwd": str(target), "status": st.strip()[:2000], "recent_commits": lg.strip()[:1500]}
+        except subprocess.CalledProcessError as exc:
+            return {"ok": False, "error": (exc.output or str(exc)).strip()[:600]}
 
     if kind == "files":
+        entries: list[str] = []
         try:
-            entries = []
             for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))[:60]:
                 suffix = "/" if item.is_dir() else f" ({item.stat().st_size} B)"
                 entries.append(item.name + suffix)
             return {"ok": True, "cwd": str(target), "entries": entries}
-        except Exception as exc:
-            return {"ok": False, "error": f"目录读取失败: {exc}"}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
 
     if kind == "tail_log":
         rel = str(payload.get("file") or "").strip()
         file_path = resolve_allowed_dir(str(target / rel), allowed_roots, state_dir) if rel else None
         if file_path is None or not file_path.is_file():
-            return {"ok": False, "error": "日志文件不存在或不在允许目录"}
+            return {"ok": False, "error": "日志文件不存在或不在允许目录内"}
         try:
-            lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+            lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
             return {"ok": True, "file": str(file_path), "tail": "\n".join(lines)[-4000:]}
-        except Exception as exc:
-            return {"ok": False, "error": f"日志读取失败: {exc}"}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
 
-    return build_overview(target)
+    return {"ok": False, "error": f"未知的状态查询类型: {kind}"}
 
 
 def check_blocked_code(code: str) -> str | None:
-    lower_code = code.lower()
-    for pat in BLOCKED_PATTERNS:
-        if pat in lower_code:
-            return pat
+    for label, pattern in BLOCKED_REGEXES:
+        if pattern.search(code):
+            return label
     return None
 
 
-def handle_approved_exec(payload: dict[str, Any], allowed_roots: list[str], state_dir: Path = STATE_DIR) -> dict[str, Any]:
+def handle_approved_exec(
+    payload: dict[str, Any],
+    allowed_roots: list[str],
+    state_dir: Path = STATE_DIR,
+    allow_shell: bool = False,
+) -> dict[str, Any]:
     mode = str(payload.get("mode") or "python").strip().lower()
     code = str(payload.get("code") or "").strip()
     raw_dir = payload.get("cwd")
-    timeout_sec = min(60, max(2, int(payload.get("timeout") or 25)))
+    try:
+        timeout_sec = min(60, max(2, int(payload.get("timeout") or 25)))
+    except (TypeError, ValueError):
+        timeout_sec = 25
 
     if not code:
         return {"ok": False, "error": "没有要执行的代码或命令"}
@@ -278,6 +348,13 @@ def handle_approved_exec(payload: dict[str, Any], allowed_roots: list[str], stat
     if hit:
         append_audit({"action": "exec_blocked", "mode": mode, "reason": hit}, state_dir)
         return {"ok": False, "error": f"安全策略拦截了高危指令片段: {hit}"}
+
+    if mode == "command" and not allow_shell:
+        append_audit({"action": "exec_shell_disabled", "mode": mode}, state_dir)
+        return {
+            "ok": False,
+            "error": "电脑桥默认关闭终端 Shell 模式（仍可用 python / node 模式）。若确需开启终端命令，请在电脑端以 python3 bridge/pib_bridge.py --allow-shell 启动。",
+        }
 
     target = resolve_allowed_dir(raw_dir if isinstance(raw_dir, str) else None, allowed_roots, state_dir)
     if target is None or not target.is_dir():
@@ -322,6 +399,110 @@ def handle_approved_exec(payload: dict[str, Any], allowed_roots: list[str], stat
                 os.remove(tmp_script)
             except OSError:
                 pass
+
+
+class IdempotencyCache:
+    """Single-flight + 10-minute TTL response deduplicator for non-idempotent POSTs."""
+
+    def __init__(self, ttl_sec: float = 600.0, max_entries: int = 512):
+        self.ttl_sec = ttl_sec
+        self.max_entries = max_entries
+        self._lock = threading.Lock()
+        self._done: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._inflight: dict[str, threading.Event] = {}
+
+    def run(self, scope: str, raw_key: str | None, fn: Any) -> dict[str, Any]:
+        key = (raw_key or "").strip()
+        if not key or len(key) > 128 or not re.fullmatch(r"[A-Za-z0-9_\-:.]+", key):
+            return fn()
+        full_key = f"{scope}:{key}"
+        now = time.time()
+        wait_event: threading.Event | None = None
+        with self._lock:
+            self._prune(now)
+            cached = self._done.get(full_key)
+            if cached is not None:
+                return dict(cached[1])
+            existing = self._inflight.get(full_key)
+            if existing is not None:
+                wait_event = existing
+            else:
+                ev = threading.Event()
+                self._inflight[full_key] = ev
+
+        if wait_event is not None:
+            wait_event.wait(timeout=35.0)
+            with self._lock:
+                cached = self._done.get(full_key)
+                if cached is not None:
+                    return dict(cached[1])
+            return {"ok": False, "error": "相同请求正在电脑端执行中，请稍后查询状态"}
+
+        try:
+            result = fn()
+            with self._lock:
+                self._done[full_key] = (time.time(), dict(result))
+            return result
+        finally:
+            with self._lock:
+                ev = self._inflight.pop(full_key, None)
+                if ev is not None:
+                    ev.set()
+
+    def _prune(self, now: float) -> None:
+        expired = [k for k, (ts, _) in self._done.items() if now - ts > self.ttl_sec]
+        for k in expired:
+            self._done.pop(k, None)
+        while len(self._done) > self.max_entries:
+            oldest = next(iter(self._done))
+            self._done.pop(oldest, None)
+
+
+class ReplayGuard:
+    """Rejects replayed HMAC nonces within the ±300s timestamp window and throttles 401 bursts."""
+
+    def __init__(self, window_sec: float = 300.0):
+        self.window_sec = window_sec
+        self._lock = threading.Lock()
+        self._nonces: dict[str, float] = {}
+        self._failures: dict[str, list[float]] = {}
+
+    def is_throttled(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            recent = [t for t in self._failures.get(ip, []) if now - t < 60.0]
+            self._failures[ip] = recent
+            return len(recent) >= 12
+
+    def record_failure(self, ip: str) -> None:
+        now = time.time()
+        with self._lock:
+            recent = [t for t in self._failures.get(ip, []) if now - t < 60.0]
+            recent.append(now)
+            self._failures[ip] = recent
+
+    def accept_nonce(self, nonce: str, ts_val: int) -> bool:
+        now = time.time()
+        if abs(now - ts_val) > self.window_sec:
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{12,80}", nonce):
+            return False
+        with self._lock:
+            cutoff = now - (self.window_sec * 2 + 30)
+            stale = [n for n, seen in self._nonces.items() if seen < cutoff]
+            for n in stale:
+                self._nonces.pop(n, None)
+            if nonce in self._nonces:
+                return False
+            self._nonces[nonce] = now
+            return True
+
+
+def compute_hmac_signature(token: str, timestamp: str, nonce: str, method: str, path: str, body: bytes) -> str:
+    body_sha = hashlib.sha256(body).hexdigest()
+    canonical = f"{timestamp}\n{nonce}\n{method.upper()}\n{path}\n{body_sha}"
+    digest = hmac.new(token.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
 
 
 class DshTaskManager:
@@ -381,7 +562,10 @@ class DshTaskManager:
         t = threading.Thread(target=self._run_worker, args=(task_id, job_dir, cwd, argv, agent_name, prompt), daemon=True)
         t.start()
 
-        wait_sec = min(25.0, max(0.0, float(payload.get("wait_seconds") or 0.0)))
+        try:
+            wait_sec = min(25.0, max(0.0, float(payload.get("wait_seconds") or 0.0)))
+        except (TypeError, ValueError):
+            wait_sec = 0.0
         if wait_sec > 0:
             deadline = time.time() + wait_sec
             while time.time() < deadline:
@@ -446,7 +630,6 @@ class DshTaskManager:
             return None, ""
         bin_path = agents[chosen]
         if chosen == "dsh":
-            # Supports custom PIB_DSH_CMD (split safely) or `dsh` binary reading prompt from stdin.
             parts = bin_path.split() if " " in bin_path and not os.path.exists(bin_path) else [bin_path]
             return parts, "dsh"
         if chosen == "codex":
@@ -545,11 +728,22 @@ class DshTaskManager:
 
 
 class BridgeApp:
-    def __init__(self, state_dir: Path = STATE_DIR, allowed_roots: list[str] | None = None, runner_override: list[str] | None = None):
+    def __init__(
+        self,
+        state_dir: Path = STATE_DIR,
+        allowed_roots: list[str] | None = None,
+        runner_override: list[str] | None = None,
+        allow_shell: bool = DEFAULT_ALLOW_SHELL,
+        allow_public_ip: bool = DEFAULT_ALLOW_PUBLIC_IP,
+    ):
         self.state_dir = state_dir
         self.token = load_or_create_token(state_dir)
         self.allowed_roots = allowed_roots or default_allowed_roots(state_dir)
+        self.allow_shell = allow_shell
+        self.allow_public_ip = allow_public_ip
         self.dsh = DshTaskManager(state_dir, self.allowed_roots, runner_override=runner_override)
+        self.idempotency = IdempotencyCache()
+        self.replay = ReplayGuard()
 
 
 def make_handler(app: BridgeApp) -> type[http.server.BaseHTTPRequestHandler]:
@@ -567,56 +761,117 @@ def make_handler(app: BridgeApp) -> type[http.server.BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(raw)
 
-        def _check_auth(self) -> bool:
+        def _check_source_ip(self) -> bool:
+            client_ip = self.client_address[0] if self.client_address else ""
+            if app.allow_public_ip or is_private_or_tailscale_ip(client_ip):
+                return True
+            append_audit({"action": "ip_rejected", "ip": client_ip}, app.state_dir)
+            self._send_json(403, {"ok": False, "error": "安全拦截：拒绝公网源 IP 直连"})
+            return False
+
+        def _read_raw_body(self) -> bytes | None:
+            raw_len = self.headers.get("Content-Length")
+            if not raw_len:
+                return b""
+            try:
+                length = int(raw_len)
+            except ValueError:
+                self._send_json(400, {"ok": False, "error": "无效的 Content-Length"})
+                return None
+            if length < 0:
+                self._send_json(400, {"ok": False, "error": "无效的 Content-Length"})
+                return None
+            if length > 256 * 1024:
+                self._send_json(413, {"ok": False, "error": "请求体过大"})
+                return None
+            return self.rfile.read(length) if length > 0 else b""
+
+        def _check_auth(self, body_bytes: bytes) -> bool:
+            client_ip = self.client_address[0] if self.client_address else "unknown"
+            if app.replay.is_throttled(client_ip):
+                self._send_json(429, {"ok": False, "error": "鉴权失败次数过多，请 1 分钟后再试"})
+                return False
+
+            sig = (self.headers.get("X-Pib-Signature") or "").strip()
+            ts_str = (self.headers.get("X-Pib-Timestamp") or "").strip()
+            nonce = (self.headers.get("X-Pib-Nonce") or "").strip()
             auth = self.headers.get("Authorization") or ""
+            if sig or ts_str or nonce:
+                try:
+                    ts_val = int(ts_str)
+                except ValueError:
+                    app.replay.record_failure(client_ip)
+                    self._send_json(401, {"ok": False, "error": "无效的签名时间戳"})
+                    return False
+                expected = compute_hmac_signature(app.token, ts_str, nonce, self.command, self.path, body_bytes)
+                if hmac.compare_digest(sig, expected):
+                    if not app.replay.accept_nonce(nonce, ts_val):
+                        app.replay.record_failure(client_ip)
+                        self._send_json(401, {"ok": False, "error": "请求已过期或重复发送（防重放拦截）"})
+                        return False
+                    return True
+                # Allow fallback to Bearer ONLY when an HTTPS reverse proxy rewrote request path
+                if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].strip(), app.token)):
+                    app.replay.record_failure(client_ip)
+                    self._send_json(401, {"ok": False, "error": "电脑桥接签名不匹配"})
+                    return False
+                return True
             if not auth.startswith("Bearer "):
-                self._send_json(401, {"ok": False, "error": "缺少 Bearer 鉴权令牌"})
+                app.replay.record_failure(client_ip)
+                self._send_json(401, {"ok": False, "error": "缺少鉴权签名或 Bearer 令牌"})
                 return False
             if not hmac.compare_digest(auth[7:].strip(), app.token):
+                app.replay.record_failure(client_ip)
                 self._send_json(401, {"ok": False, "error": "电脑桥接令牌不匹配"})
                 return False
             return True
 
-        def _read_body(self) -> dict[str, Any] | None:
-            length = int(self.headers.get("Content-Length") or "0")
-            if length <= 0:
-                return {}
-            if length > 256 * 1024:
-                self._send_json(413, {"ok": False, "error": "请求体过大"})
-                return None
-            raw = self.rfile.read(length)
-            try:
-                parsed = json.loads(raw.decode("utf-8"))
-                return parsed if isinstance(parsed, dict) else {}
-            except Exception:
-                self._send_json(400, {"ok": False, "error": "无效 JSON"})
-                return None
-
         def do_GET(self) -> None:
-            if not self._check_auth():
+            if not self._check_source_ip():
+                return
+            if not self._check_auth(b""):
                 return
             if self.path.startswith("/health"):
                 default_dir = resolve_allowed_dir(None, app.allowed_roots, app.state_dir) or Path.home()
-                self._send_json(200, build_overview(default_dir))
+                self._send_json(200, build_overview(default_dir, allow_shell=app.allow_shell))
                 return
             self._send_json(404, {"ok": False, "error": "Not found"})
 
         def do_POST(self) -> None:
-            if not self._check_auth():
+            if not self._check_source_ip():
                 return
-            body = self._read_body()
-            if body is None:
+            raw_body = self._read_raw_body()
+            if raw_body is None:
                 return
+            if not self._check_auth(raw_body):
+                return
+            if raw_body:
+                try:
+                    parsed = json.loads(raw_body.decode("utf-8"))
+                    body = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    self._send_json(400, {"ok": False, "error": "无效 JSON"})
+                    return
+            else:
+                body = {}
+
+            idem_key = self.headers.get("X-Idempotency-Key")
             if self.path == "/status":
-                self._send_json(200, handle_readonly_status(body, app.allowed_roots, app.state_dir))
+                self._send_json(200, handle_readonly_status(body, app.allowed_roots, app.state_dir, allow_shell=app.allow_shell))
                 return
             if self.path == "/exec":
-                self._send_json(200, handle_approved_exec(body, app.allowed_roots, app.state_dir))
+                res = app.idempotency.run(
+                    "/exec",
+                    idem_key,
+                    lambda: handle_approved_exec(body, app.allowed_roots, app.state_dir, allow_shell=app.allow_shell),
+                )
+                self._send_json(200, res)
                 return
             if self.path == "/dsh":
                 action = str(body.get("action") or "submit").strip().lower()
                 if action == "submit":
-                    self._send_json(200, app.dsh.submit(body))
+                    res = app.idempotency.run("/dsh:submit", idem_key, lambda: app.dsh.submit(body))
+                    self._send_json(200, res)
                 elif action == "poll":
                     self._send_json(200, app.dsh.poll(str(body.get("task_id") or "")))
                 elif action == "list":
@@ -635,9 +890,47 @@ def detect_lan_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("223.5.5.5", 80))
-            return s.getsockname()[0]
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
     except Exception:
-        return "127.0.0.1"
+        pass
+    return "127.0.0.1"
+
+
+def detect_tailscale_ip() -> str | None:
+    # 1. Try Tailscale MagicDNS / quad-100 route table lookup without sending packets
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("100.100.100.100", 80))
+            ip = s.getsockname()[0]
+            if ipaddress.ip_address(ip) in TAILSCALE_NET:
+                return ip
+    except Exception:
+        pass
+    # 2. Fallback to `tailscale ip -4` CLI if installed
+    ts_bin = shutil.which("tailscale", path=EXTENDED_PATH) or "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    if ts_bin and os.path.exists(ts_bin):
+        try:
+            out = subprocess.check_output([ts_bin, "ip", "-4"], text=True, stderr=subprocess.DEVNULL, timeout=2)
+            for line in out.splitlines():
+                cand = line.strip()
+                if cand and ipaddress.ip_address(cand) in TAILSCALE_NET:
+                    return cand
+        except Exception:
+            pass
+    return None
+
+
+def resolve_bind_hosts(explicit_bind: str, lan_enabled: bool, tailscale_ip: str | None) -> list[str]:
+    if explicit_bind:
+        return [explicit_bind]
+    if lan_enabled:
+        return ["0.0.0.0"]
+    hosts = ["127.0.0.1"]
+    if tailscale_ip and tailscale_ip not in hosts:
+        hosts.append(tailscale_ip)
+    return hosts
 
 
 def build_pairing_uri(url: str, token: str, fallback: str = "") -> str:
@@ -650,25 +943,62 @@ def build_pairing_uri(url: str, token: str, fallback: str = "") -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pib Computer & DSH/Codex Bridge")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--bind", default=DEFAULT_BIND)
+    parser.add_argument("--bind", default=DEFAULT_BIND, help="Explicit bind IP (overrides default loopback+Tailscale)")
+    parser.add_argument("--lan", action="store_true", default=DEFAULT_LAN, help="Also listen on private Wi-Fi LAN interfaces (0.0.0.0)")
+    parser.add_argument("--allow-shell", action="store_true", default=DEFAULT_ALLOW_SHELL, help="Enable /exec mode=command shell execution")
+    parser.add_argument("--allow-public-ip", action="store_true", default=DEFAULT_ALLOW_PUBLIC_IP, help="Allow non-private client IPs (only behind HTTPS proxy)")
     parser.add_argument("--print-pair", action="store_true", help="Print pairing link and exit")
     args = parser.parse_args()
 
-    app = BridgeApp()
-    lan_url = f"http://{detect_lan_ip()}:{args.port}"
-    pair_uri = build_pairing_uri(lan_url, app.token)
+    app = BridgeApp(allow_shell=args.allow_shell, allow_public_ip=args.allow_public_ip)
+    ts_ip = detect_tailscale_ip()
+    lan_ip = detect_lan_ip()
+    bind_hosts = resolve_bind_hosts(args.bind, args.lan, ts_ip)
+
+    if args.lan or (args.bind and args.bind not in ("127.0.0.1", "localhost")):
+        primary_ip = lan_ip if args.bind in ("", "0.0.0.0") else args.bind
+        primary_url = f"http://{primary_ip}:{args.port}"
+        fallback_url = f"http://{ts_ip}:{args.port}" if ts_ip and ts_ip != primary_ip else ""
+    elif ts_ip:
+        primary_url = f"http://{ts_ip}:{args.port}"
+        fallback_url = ""
+    else:
+        primary_url = f"http://127.0.0.1:{args.port}"
+        fallback_url = ""
+
+    pair_uri = build_pairing_uri(primary_url, app.token, fallback=fallback_url)
 
     if args.print_pair:
         print(pair_uri)
         return
 
-    server = http.server.ThreadingHTTPServer((args.bind, args.port), make_handler(app))
-    append_audit({"action": "bridge_start", "bind": args.bind, "port": args.port}, app.state_dir)
-    print(f"Pib Bridge v{VERSION} listening on {lan_url}", flush=True)
-    print(f"Detected local agents: {', '.join(detect_agents().keys()) or 'none (python/node/command still active)'}", flush=True)
+    handler_cls = make_handler(app)
+    servers: list[http.server.ThreadingHTTPServer] = []
+    for host in bind_hosts:
+        try:
+            srv = http.server.ThreadingHTTPServer((host, args.port), handler_cls)
+            servers.append(srv)
+        except OSError as exc:
+            if host == "127.0.0.1":
+                raise
+            print(f"Warning: could not bind Tailscale address {host}:{args.port} ({exc})", file=sys.stderr)
+
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    bound_desc = ", ".join(f"{s.server_address[0]}:{s.server_address[1]}" for s in servers)
+    append_audit({"action": "bridge_start", "bound": bound_desc, "allow_shell": args.allow_shell}, app.state_dir)
+    print(f"Pib Bridge v{VERSION} listening on [{bound_desc}]", flush=True)
+    print(f"Detected local agents: {', '.join(detect_agents().keys()) or 'none (python/node active)'} | shell={'on' if args.allow_shell else 'off'}", flush=True)
+    if not args.lan and not ts_ip and not args.bind:
+        print("Note: bound to 127.0.0.1 only. For same-Wi-Fi phone access without Tailscale, restart with: python3 bridge/pib_bridge.py --lan", flush=True)
     print("\nCopy this pairing link into Pib [更多 → 远程电脑与 DSH 桥 → 粘贴配对链接]:", flush=True)
     print(pair_uri, flush=True)
-    server.serve_forever()
+    try:
+        servers[0].serve_forever()
+    except KeyboardInterrupt:
+        for srv in servers:
+            srv.shutdown()
 
 
 if __name__ == "__main__":

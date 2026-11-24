@@ -20,11 +20,13 @@ object BalanceClient {
     suspend fun query(baseUrl: String, apiKey: String): String = withContext(Dispatchers.IO) {
         val key = apiKey.trim()
         if (key.isEmpty()) return@withContext "未填写 API Key"
-        val host = baseUrl.lowercase()
+        runCatching { EndpointSecurity.validateUrl(baseUrl, "模型接口地址") }
+            .onFailure { return@withContext "安全拦截：${it.message}" }
+        val host = EndpointSecurity.hostOf(baseUrl) ?: return@withContext "接口地址无效"
         val url = when {
-            "deepseek.com" in host -> "https://api.deepseek.com/user/balance"
-            "siliconflow.cn" in host -> "https://api.siliconflow.cn/v1/user/info"
-            "openrouter.ai" in host -> "https://openrouter.ai/api/v1/key"
+            host == "api.deepseek.com" || host.endsWith(".deepseek.com") -> "https://api.deepseek.com/user/balance"
+            host == "api.siliconflow.cn" || host.endsWith(".siliconflow.cn") -> "https://api.siliconflow.cn/v1/user/info"
+            host == "openrouter.ai" || host.endsWith(".openrouter.ai") -> "https://openrouter.ai/api/v1/key"
             else -> return@withContext "该厂商请前往网页控制台查看余额"
         }
         runCatching {
@@ -37,10 +39,11 @@ object BalanceClient {
         }.getOrElse { "查询失败：${it.message}" }
     }
 
-    internal fun parseBalance(host: String, body: String): String {
+    internal fun parseBalance(hostOrUrl: String, body: String): String {
+        val h = EndpointSecurity.hostOf(hostOrUrl) ?: hostOrUrl.lowercase()
         val obj = json.parseToJsonElement(body).jsonObject
         return when {
-            "deepseek.com" in host -> {
+            h == "api.deepseek.com" || h.endsWith(".deepseek.com") || h == "deepseek.com" -> {
                 val infos = obj["balance_infos"]?.jsonArray.orEmpty()
                 if (infos.isEmpty()) "账户可用"
                 else infos.joinToString(" · ") {
@@ -48,11 +51,11 @@ object BalanceClient {
                     "${o["currency"]?.jsonPrimitive?.contentOrNull ?: "CNY"} ${o["total_balance"]?.jsonPrimitive?.contentOrNull ?: "0.00"}"
                 }
             }
-            "siliconflow.cn" in host -> {
+            h == "api.siliconflow.cn" || h.endsWith(".siliconflow.cn") || h == "siliconflow.cn" -> {
                 val bal = obj["data"]?.jsonObject?.get("totalBalance")?.jsonPrimitive?.contentOrNull
                 if (bal != null) "CNY $bal" else "账户可用"
             }
-            "openrouter.ai" in host -> {
+            h == "openrouter.ai" || h.endsWith(".openrouter.ai") -> {
                 val rem = obj["data"]?.jsonObject?.get("limit_remaining")?.jsonPrimitive?.doubleOrNull
                 if (rem != null) "USD %.2f".format(rem) else "不限额或请在官网查看"
             }

@@ -6,10 +6,13 @@ import com.houxinzhe.pib.agent.ToolContext
 import com.houxinzhe.pib.agent.ToolResult
 import com.houxinzhe.pib.agent.i
 import com.houxinzhe.pib.agent.s
+import com.houxinzhe.pib.llm.EndpointSecurity
 import com.houxinzhe.pib.llm.int
 import com.houxinzhe.pib.llm.schema
 import com.houxinzhe.pib.llm.str
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -19,12 +22,19 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import okhttp3.Call
+import okhttp3.EventListener
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.net.URI
+import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import kotlin.coroutines.coroutineContext
 
 data class BridgeConfig(
     val enabled: Boolean,
@@ -37,9 +47,13 @@ data class BridgeConfig(
 class BridgeException(message: String) : Exception(message)
 
 /**
- * Authenticated HTTP client for `pib_bridge.py` (and backward-compatible `:18791` Mac bridges).
- * Security invariant: cleartext `http://` is permitted ONLY for loopback, `.local` Bonjour,
- * RFC1918 LAN, or Tailscale CGNAT (`100.64.0.0/10`); public internet hosts MUST use `https://`.
+ * Authenticated HTTP client for `pib_bridge.py`.
+ * Security & reliability invariants:
+ * 1. Cleartext `http://` is permitted ONLY for loopback, `.local`, `.ts.net`, RFC1918 LAN, or Tailscale CGNAT.
+ * 2. Authenticates via HMAC-SHA256 (`X-Pib-Timestamp`, `X-Pib-Nonce`, `X-Pib-Signature`) so the raw
+ *    token is never transmitted in cleartext over LAN Wi-Fi.
+ * 3. Sends `X-Idempotency-Key` on POSTs and ONLY fails over to `fallbackUrl` when the failure occurred
+ *    before request bytes were sent (connect/DNS error), preventing duplicate execution on read timeouts.
  */
 class RemoteBridgeClient(
     private val config: () -> BridgeConfig,
@@ -56,37 +70,80 @@ class RemoteBridgeClient(
     private suspend fun call(method: String, path: String, payload: JsonObject?, timeoutSec: Int): JsonObject = withContext(Dispatchers.IO) {
         val cfg = config()
         if (!cfg.enabled) throw BridgeException("尚未开启「远程电脑与 DSH 桥」，请到「更多 → 远程电脑与 DSH 桥」开启。")
-        if (cfg.token.isBlank()) throw BridgeException("尚未配置电脑桥接令牌，请到「更多 → 远程电脑与 DSH 桥」粘贴 pib:// 配对链接。")
+        val cleanToken = cfg.token.trim()
+        if (cleanToken.isBlank()) throw BridgeException("尚未配置电脑桥接令牌，请到「更多 → 远程电脑与 DSH 桥」粘贴 pib:// 配对链接。")
         val bases = listOf(cfg.primaryUrl.trim(), cfg.fallbackUrl.trim()).filter { it.isNotEmpty() }.distinct()
         if (bases.isEmpty()) throw BridgeException("尚未填写电脑桥地址。")
 
-        val client = http.newBuilder().readTimeout(timeoutSec.toLong(), TimeUnit.SECONDS).build()
+        val bodyText = if (method == "GET") "" else (payload ?: buildJsonObject {}).toString()
+        val bodyBytes = bodyText.toByteArray(Charsets.UTF_8)
+        val idempotencyKey = if (method == "POST") UUID.randomUUID().toString() else null
+
         var lastError = "无法连接电脑桥"
         for (base in bases) {
             val safeBase = validateEndpoint(base)
             val url = safeBase.trimEnd('/') + path
+            val ts = (System.currentTimeMillis() / 1000).toString()
+            val nonce = UUID.randomUUID().toString().replace("-", "")
+            val sig = signRequest(cleanToken, ts, nonce, method, path, bodyBytes)
+
             val reqBuilder = Request.Builder()
                 .url(url)
-                .header("Authorization", "Bearer ${cfg.token.trim()}")
+                .header("X-Pib-Timestamp", ts)
+                .header("X-Pib-Nonce", nonce)
+                .header("X-Pib-Signature", sig)
+            if (safeBase.lowercase().startsWith("https://")) {
+                reqBuilder.header("Authorization", "Bearer $cleanToken")
+            }
+            if (idempotencyKey != null) {
+                reqBuilder.header("X-Idempotency-Key", idempotencyKey)
+            }
             val req = if (method == "GET") reqBuilder.get().build()
-            else reqBuilder.post((payload ?: buildJsonObject {}).toString().toRequestBody(media)).build()
+            else reqBuilder.post(bodyText.toRequestBody(media)).build()
+
+            val requestSent = AtomicBoolean(false)
+            val client = http.newBuilder()
+                .readTimeout(timeoutSec.toLong(), TimeUnit.SECONDS)
+                .eventListener(object : EventListener() {
+                    override fun requestHeadersEnd(call: Call, request: Request) {
+                        requestSent.set(true)
+                    }
+                    override fun requestBodyEnd(call: Call, byteCount: Long) {
+                        requestSent.set(true)
+                    }
+                })
+                .build()
+
+            val httpCall = client.newCall(req)
+            val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { cause ->
+                if (cause != null) httpCall.cancel()
+            }
             try {
-                client.newCall(req).execute().use { resp ->
+                httpCall.execute().use { resp ->
                     val raw = resp.body?.string().orEmpty()
-                    if (resp.code == 401) throw BridgeException("电脑桥接令牌不匹配（401），请重新复制配对链接。")
+                    if (resp.code == 401) throw BridgeException("电脑桥接鉴权未通过（401），请确认电脑运行最新版 pib_bridge.py 或重新配对。")
+                    if (resp.code == 403) throw BridgeException("电脑桥拒绝了当前网络来源（403）：${raw.take(100)}")
                     if (resp.code == 404 && path == "/dsh") {
                         throw BridgeException("当前电脑端运行的是旧版桥，不支持 /dsh；请在电脑运行新版 python3 bridge/pib_bridge.py。")
                     }
                     if (!resp.isSuccessful) throw BridgeException("电脑桥返回 HTTP ${resp.code}：${raw.take(140)}")
                     return@withContext json.parseToJsonElement(raw).jsonObject
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: BridgeException) {
                 throw e
             } catch (e: Exception) {
+                if (coroutineContext[Job]?.isActive == false) throw CancellationException("已取消请求")
+                if (requestSent.get() && method == "POST") {
+                    throw BridgeException("请求已送达电脑（$base），但等待响应超时或中断（${e.message ?: e.javaClass.simpleName}）。为防止重复执行，未自动重发到备用地址；可稍后查询状态。")
+                }
                 lastError = "${base}: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                cancelHandle?.dispose()
             }
         }
-        throw BridgeException("连接电脑失败（请确认手机与电脑在同一局域网/Tailscale 且已启动 pib_bridge.py）：$lastError")
+        throw BridgeException("连接电脑失败（请确认手机与电脑在同一 Tailscale / 局域网，且电脑已启动 pib_bridge.py）：$lastError")
     }
 
     companion object {
@@ -96,32 +153,32 @@ class RemoteBridgeClient(
             .writeTimeout(15, TimeUnit.SECONDS)
             .build()
 
-        /** Ensures Bearer tokens are never sent over cleartext HTTP to public internet hosts. */
-        fun validateEndpoint(raw: String): String {
-            val uri = runCatching { URI(raw.trim()) }.getOrNull() ?: throw BridgeException("电脑桥地址格式无效：$raw")
-            val scheme = uri.scheme?.lowercase() ?: throw BridgeException("电脑桥地址缺少协议（http:// 或 https://）")
-            val host = uri.host?.lowercase()?.trim('[', ']') ?: throw BridgeException("电脑桥地址缺少主机名或 IP")
-            if (scheme == "https") return raw.trim()
-            if (scheme != "http") throw BridgeException("不支持的协议：$scheme")
-            if (!isPrivateOrLocalHost(host)) {
-                throw BridgeException("安全拦截：公网地址必须使用 https://（仅局域网 IP、Tailscale 100.x 或 .local 允许 http://）。")
-            }
-            return raw.trim()
+        /** Ensures credentials are never sent over cleartext HTTP to public internet hosts. */
+        fun validateEndpoint(raw: String): String = try {
+            EndpointSecurity.validateUrl(raw, "电脑桥地址")
+        } catch (e: IllegalArgumentException) {
+            throw BridgeException(e.message ?: "电脑桥地址无效")
         }
 
-        fun isPrivateOrLocalHost(host: String): Boolean {
-            val h = host.lowercase()
-            if (h == "localhost" || h == "127.0.0.1" || h == "::1" || h.endsWith(".local") || h.endsWith(".ts.net")) return true
-            val parts = h.split('.')
-            if (parts.size == 4 && parts.all { it.toIntOrNull() in 0..255 }) {
-                val a = parts[0].toInt()
-                val b = parts[1].toInt()
-                if (a == 10 || a == 127) return true
-                if (a == 192 && b == 168) return true
-                if (a == 172 && b in 16..31) return true
-                if (a == 100 && b in 64..127) return true // Tailscale / CGNAT
-            }
-            return false
+        fun isPrivateOrLocalHost(host: String): Boolean = EndpointSecurity.isPrivateOrLocalHost(host)
+
+        internal fun signRequest(
+            token: String,
+            timestamp: String,
+            nonce: String,
+            method: String,
+            path: String,
+            bodyBytes: ByteArray,
+        ): String {
+            val bodySha = MessageDigest.getInstance("SHA-256")
+                .digest(bodyBytes)
+                .joinToString("") { "%02x".format(it) }
+            val canonical = "$timestamp\n$nonce\n${method.uppercase()}\n$path\n$bodySha"
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(token.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            val digest = mac.doFinal(canonical.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            return "sha256=$digest"
         }
     }
 }
@@ -166,6 +223,8 @@ class BridgeStatusTool(private val bridge: RemoteBridgeClient) : Tool {
                 }
             }
         }
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (e: BridgeException) {
         ToolResult.fail(e.message ?: "电脑状态查询失败")
     }
@@ -175,7 +234,7 @@ class BridgeExecTool(private val bridge: RemoteBridgeClient) : Tool {
     override val name = "bridge_exec"
     override val title = "在电脑运行代码或命令"
     override val risk = Risk.SENSITIVE
-    override val description = "在已配对的电脑上执行一段 Python 脚本、Node.js 脚本或终端命令（每次必须经用户在手机弹窗点击确认后才会真正运行）。"
+    override val description = "在已配对的电脑上执行一段 Python 脚本、Node.js 脚本或（电脑已显式开启 --allow-shell 时的）终端命令。每次必须经用户在手机弹窗点击确认后才会真正运行。"
     override val parameters = schema(
         str("mode", "运行方式", required = true, enum = listOf("python", "node", "command")),
         str("code", "要运行的脚本或终端命令", required = true),
@@ -211,6 +270,8 @@ class BridgeExecTool(private val bridge: RemoteBridgeClient) : Tool {
             val err = resp.str("error") ?: resp.str("stderr") ?: "退出码 ${resp.str("exit_code")}"
             ToolResult.fail("电脑执行未通过：$err")
         }
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (e: BridgeException) {
         ToolResult.fail(e.message ?: "电脑执行失败")
     }
@@ -259,6 +320,8 @@ class DshDelegateTool(private val bridge: RemoteBridgeClient) : Tool {
                 else -> ToolResult.ok("已委派给电脑 $agent 后台运行，任务编号：$id。稍后可随时调用 dsh_status(action=\"poll\", task_id=\"$id\") 查看结果。")
             }
         }
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (e: BridgeException) {
         ToolResult.fail(e.message ?: "DSH 桥连接失败")
     }
@@ -306,6 +369,8 @@ class DshStatusTool(private val bridge: RemoteBridgeClient) : Tool {
             val elapsed = resp.str("elapsed_sec")?.let { "（已运行 ${it}s）" }.orEmpty()
             ToolResult.ok("任务 [$id] 状态：$st$elapsed${if (summary.isNotBlank()) "\n$summary" else ""}")
         }
+    } catch (ce: CancellationException) {
+        throw ce
     } catch (e: BridgeException) {
         ToolResult.fail(e.message ?: "DSH 任务查询失败")
     }
