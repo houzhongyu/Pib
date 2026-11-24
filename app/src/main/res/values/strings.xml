@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pib</string>
+    <string name="share_label">发给 Pib</string>
+    <string name="a11y_description">仅在你授权的白名单普通应用内，按你的指令辅助读取控件或点击按钮。绝不读取或操作微信、支付宝、银行及任何密码支付页面。</string>
+</resources>
